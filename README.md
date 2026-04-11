@@ -1,3 +1,6 @@
+Currently under refactoring
+
+
 # DatabaseArchiving
 PowerShell script automatically creates a table script for the destination database (if the table not exists) and if a new column added to the source it adds that column to the destination. Also, the script supports resume after failure.
 
