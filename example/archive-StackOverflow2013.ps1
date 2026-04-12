@@ -1,4 +1,3 @@
-# For PowerShell 7.0+
 . (Join-Path $PSScriptRoot '..' 'easy-archiving.ps1')
 
 Invoke-EasyArchiving -ConnStr 'Data Source=(local);Initial Catalog=easy-archiving;Connection Timeout=5;

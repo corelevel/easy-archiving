@@ -2,14 +2,25 @@ using namespace System.Data.SqlClient
 using namespace System.Collections.Generic
 
 function Write-LogMessage {
-	Param (
-		[parameter(Mandatory)]
+	param(
 		[string]$Message,
-
-		[string]$LogFile
+		[string]$LogFile,
+		[ValidateSet('Info','Warning','Error')]
+		[string]$Level = 'Info'
 	)
-	$line = (Get-Date).ToString('[MM/dd/yy HH:mm:ss.ff]') + ' ' + $Message
-	Write-Verbose $line
+
+	$line = "$((Get-Date).ToString('[MM/dd/yy HH:mm:ss.ff]')) [$Level] $Message"
+
+	if ($Level -eq 'Warning') {
+		Write-Warning $Message
+	}
+	elseif ($Level -eq 'Error') {
+		Write-Error $Message
+	}
+	else {
+		Write-Verbose $line
+	}
+
 	if ($LogFile) {
 		Add-Content -Path $LogFile -Value $line
 	}
@@ -25,6 +36,101 @@ function Get-DelayIntervalInSeconds {
 	$d2 = [datetime]::ParseExact('01010001 00:00:00', 'ddMMyyyy HH:mm:ss', $null)
 
 	$d1.Subtract($d2).TotalSeconds
+}
+
+function Compare-Columns {
+	param (
+		[Parameter(Mandatory)]
+		[Dictionary[string, TableColumn]]$SrcColumns,
+
+		[Parameter(Mandatory)]
+		[Dictionary[string, TableColumn]]$DstColumns,
+
+		[string]$LogFile
+	)
+
+	foreach($srcColumn in $SrcColumns.Values) {
+		$dstColumn = $null
+		$b = $DstColumns.TryGetValue($srcColumn.Name, [ref]$dstColumn)
+		if ($b) {
+			if ($dstColumn.DataType -ne $srcColumn.DataType) {
+				throw "Column [$($srcColumn.Name)] data type doesn't match in source and target tables"
+			}
+			if ($dstColumn.Collation -ne $srcColumn.Collation) {
+				Write-LogMessage -Message "Collation attribute for the column [$($srcColumn.Name)] doesn't match in source and target tables" `
+					-LogFile $LogFile -Level Warning
+			}
+			if ($dstColumn.Computed -ne $srcColumn.Computed) {
+				Write-LogMessage -Message "Computed attribute for the column [$($srcColumn.Name)] doesn't match in source and target tables" `
+					-LogFile $LogFile -Level Warning
+			}
+			if ($dstColumn.Nullable -ne $srcColumn.Nullable) {
+				Write-LogMessage -Message "Nullability attribute for the column [$($srcColumn.Name)] doesn't match in source and target tables" `
+					-LogFile $LogFile -Level Warning
+			}
+		}
+		else {
+			Write-LogMessage -Message "Column [$($srcColumn.Name)] doesn't exist in the destination table" `
+				-LogFile $LogFile
+		}
+	}
+}
+
+function Invoke-SimpleQuery {
+	param (
+		[Parameter(Mandatory)]
+		[SqlConnection]$SqlConn,
+		
+		[Parameter(Mandatory)]
+		[string]$Query,
+
+		[System.Data.CommandType]$CommandType = [System.Data.CommandType]::Text,
+		[hashtable]$Parameters,
+		[switch]$Scalar
+	)
+
+	$sqlCmd = [SqlCommand]::new($Query, $SqlConn)
+	$sqlCmd.CommandType = $CommandType
+
+	if ($Parameters) {
+		foreach ($name in $Parameters.Keys) {
+			$paramValue = $Parameters[$name]
+			if ($paramValue -isnot [hashtable] -and -not $paramValue.ContainsKey('Value')) {
+				throw 'Invalid Parameters value'
+			}
+
+			$type = $paramValue.Type
+			if (-not $type) {
+				throw 'Parameter type not specified'
+			}
+			$sqlParam = $sqlCmd.Parameters.Add("@$name", $type)
+
+			if ($paramValue.ContainsKey('Size')) {
+				$sqlParam.Size = $paramValue.Size
+			}
+			if ($paramValue.ContainsKey('Precision')) {
+				$sqlParam.Precision = $paramValue.Precision
+			}
+			if ($paramValue.ContainsKey('Scale')) {
+				$sqlParam.Scale = $paramValue.Scale
+			}
+
+			$value = $paramValue.Value
+			$sqlParam.Value = if ($null -eq $value) { [DBNull]::Value } else { $value }
+		}
+	}
+
+	try {
+		if ($Scalar) {
+			return $sqlCmd.ExecuteScalar()
+		}
+		else {
+			$sqlCmd.ExecuteNonQuery()
+		}
+	}
+	finally {
+		$sqlCmd.Dispose()
+	}
 }
 
 class TableColumn {
@@ -46,7 +152,7 @@ class Index {
 	[bool]$Unique
 }
 
-class TableGroup {
+class TableGroup : System.IDisposable {
 	[int]$Id
 	[string]$Name
 
@@ -58,11 +164,11 @@ class TableGroup {
 
 	[bool]$DisableFK
 
-	$ArcSqlConn = [SqlConnection]::new()
-	$SrcSqlConn = [SqlConnection]::new()
-	$DstSqlConn = [SqlConnection]::new()
+	[SqlConnection]$ArcSqlConn = [SqlConnection]::new()
+	[SqlConnection]$SrcSqlConn = [SqlConnection]::new()
+	[SqlConnection]$DstSqlConn = [SqlConnection]::new()
 
-	$SourceTables = [List[Table]]::new()
+	[List[Table]]$SourceTables = [List[Table]]::new()
 
 	TableGroup([string]$ConnStr, [string]$groupName) {
 		$sqlCmd = $null
@@ -165,10 +271,10 @@ class TableGroup {
 	}
 
 	Dispose() {
-		if ($this.ArcSqlConn) { $this.ArcSqlConn.Dispose() }
-		if ($this.SrcSqlConn) { $this.SrcSqlConn.Dispose() }
-		if ($this.DstSqlConn) { $this.DstSqlConn.Dispose() }
-	}
+        $this.ArcSqlConn?.Dispose()
+        $this.SrcSqlConn?.Dispose()
+        $this.DstSqlConn?.Dispose()
+    }
 }
 
 class ProcessState {
@@ -194,127 +300,123 @@ class ProcessState {
 	[int]$RowsCopiedForBatch
 	[int]$RowsPurgedForBatch
 
-	[SqlConnection]$SqlConn
+	[SqlConnection]$ArcSqlConn
 
 	UpdateKeyMaxValue() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_UpdateKeyMaxValue', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-
-			$this.KeyMaxValue = [int]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		$this.KeyMaxValue = [int](Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateKeyMaxValue' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+			} `
+			-Scalar
+		)
 	}
 
 	UpdateKeyCopyDate() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_UpdateProcessState', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-			$pKeyCopyDate = $sqlCmd.Parameters.Add('@KeyCopyDate', [System.Data.SqlDbType]::DateTime)
-			$pKeyCopyDate.Value = [DateTime]::Now
-
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				KeyCopyDate = @{
+					Value = [DateTime]::Now
+					Type  = [System.Data.SqlDbType]::DateTime
+				}
 			}
-		}
 	}
 
 	UpdateCompleteDate() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_UpdateProcessState', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-			$pCompleteDate = $sqlCmd.Parameters.Add('@CompleteDate', [System.Data.SqlDbType]::DateTime)
-			$pCompleteDate.Value = [DateTime]::Now
-
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				CompleteDate = @{
+					Value = [DateTime]::Now
+					Type  = [System.Data.SqlDbType]::DateTime
+				}
 			}
-		}
 	}
 
 	UpdateArchiveState() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_UpdateProcessState', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-			$pLastArchivedKey = $sqlCmd.Parameters.Add('@LastArchivedKey', [System.Data.SqlDbType]::Int)
-			$pLastArchivedKey.Value = $this.LastArchivedKey
-			$pRowsCopied = $sqlCmd.Parameters.Add('@RowsCopied', [System.Data.SqlDbType]::Int)
-			$pRowsCopied.Value = $this.RowsCopied
-			$pLastArchivedDate = $sqlCmd.Parameters.Add('@LastArchivedDate', [System.Data.SqlDbType]::DateTime)
-			$pLastArchivedDate.Value = [DateTime]::Now
-
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastArchivedKey = @{
+					Value = $this.LastArchivedKey
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				RowsCopied = @{
+					Value = $this.RowsCopied
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastArchivedDate = @{
+					Value = [DateTime]::Now
+					Type  = [System.Data.SqlDbType]::DateTime
+				}
 			}
-		}
 	}
 
 	UpdatePurgeState() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_UpdateProcessState', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-			$pLastPurgedKey = $sqlCmd.Parameters.Add('@LastPurgedKey', [System.Data.SqlDbType]::Int)
-			$pLastPurgedKey.Value = $this.LastPurgedKey
-			$pRowsPurged = $sqlCmd.Parameters.Add('@RowsPurged', [System.Data.SqlDbType]::Int)
-			$pRowsPurged.Value = $this.RowsPurged
-			$pLastPurgedDate = $sqlCmd.Parameters.Add('@LastPurgedDate', [System.Data.SqlDbType]::DateTime)
-			$pLastPurgedDate.Value = [DateTime]::Now
-
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastPurgedKey = @{
+					Value = $this.LastPurgedKey
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				RowsPurged = @{
+					Value = $this.RowsPurged
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastPurgedDate = @{
+					Value = [DateTime]::Now
+					Type  = [System.Data.SqlDbType]::DateTime
+				}
 			}
-		}
 	}
 
 	Create() {
 		if ($this.Id -ne 0) {
-			return
+			throw 'State.Id already has a value'
 		}
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_InsertProcessState', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pSourceTableId = $sqlCmd.Parameters.Add('@SourceTableId', [System.Data.SqlDbType]::Int)
-			$pSourceTableId.Value = $this.SourceTableId
-
-			$this.Id = [int]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		$this.Id = [int](Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_InsertProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				SourceTableId = @{
+					Value = $this.SourceTableId
+					Type  = [System.Data.SqlDbType]::Int
+				}
+			} `
+			-Scalar
+		)
 	}
 
 	[bool]ArchiveProcessHasRowsForNextBatch() {
@@ -330,20 +432,18 @@ class ProcessState {
 	}
 
 	FixAndGetLastArchivedKey() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_FixLastArchivedKey', $this.SqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-
-			$this.LastArchivedKey = [long]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		$this.LastArchivedKey = [int](Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_FixLastArchivedKey' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+			} `
+			-Scalar
+		)
 	}
 
 	SetRowsCopied($count) {
@@ -381,7 +481,7 @@ class Table {
 	[Index]$DstCl
 	[List[IndexColumn]]$DstPkColumns
 	[List[IndexColumn]]$DstClColumns
-	$MissedColumns = [List[TableColumn]]::new()
+	[List[TableColumn]]$MissedColumns = [List[TableColumn]]::new()
 	[bool]$FKDisabled = $false
 
 	GetState() {
@@ -390,7 +490,7 @@ class Table {
 		try {
 			$this.State = [ProcessState]@{
 				SourceTableId = $this.Id
-				SqlConn = $this.Group.ArcSqlConn
+				ArcSqlConn = $this.Group.ArcSqlConn
 				IncompleteProcess = $false
 			}
 
@@ -470,18 +570,23 @@ select	case when exists
 			else 0
 		end v
 '@
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query, $sqlConnection)
-			$sqlCmd.Parameters.Add("@SchemaName", [System.Data.SqlDbType]::NVarChar, 128).Value = $schemaName
-			$sqlCmd.Parameters.Add("@TableName", [System.Data.SqlDbType]::NVarChar, 128).Value = $tableName
-			return [bool]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		return [bool](Invoke-SimpleQuery `
+			-SqlConn $sqlConnection `
+			-Query $query `
+			-Parameters @{
+				SchemaName = @{
+					Value = $schemaName
+					Type  = [System.Data.SqlDbType]::NVarChar
+					Size  = 128
+				}
+				TableName = @{
+					Value = $tableName
+					Type  = [System.Data.SqlDbType]::NVarChar
+					Size  = 128
+				}
+			} `
+			-Scalar
+		)
 	}
 
 	static [bool]IsTableSchemaExists([string]$schemaName, [SqlConnection]$sqlConnection) {
@@ -489,17 +594,18 @@ select	case when exists
 set nocount on
 select case when exists (select	1 from sys.schemas where [name] = @SchemaName) then 1 else 0 end v
 '@
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query, $sqlConnection)
-			$sqlCmd.Parameters.Add("@SchemaName", [System.Data.SqlDbType]::NVarChar, 128).Value = $schemaName
-			return [bool]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		return [bool](Invoke-SimpleQuery `
+			-SqlConn $sqlConnection `
+			-Query $query `
+			-Parameters @{
+				SchemaName = @{
+					Value = $schemaName
+					Type  = [System.Data.SqlDbType]::NVarChar
+					Size  = 128
+				}
+			} `
+			-Scalar
+		)
 	}
 
 	static [string]GetColumnDefinition([TableColumn]$c) {
@@ -560,7 +666,7 @@ where TABLE_SCHEMA = @SchemaName and TABLE_NAME = @TableName
 				$columns[$sqlReader['Name']] = ([TableColumn]@{
 					Name = $sqlReader['Name']
 					DataType = $sqlReader['DataType']
-					Collation = if ($sqlReader['Collation'] -isnot [System.DBNull]) { $sqlReader['Collation'] } else { '' }
+					Collation = if ($sqlReader['Collation'] -isnot [System.DBNull]) { $sqlReader['Collation'] } else { $null }
 					Computed = $sqlReader['Computed']
 					Nullable = $sqlReader['Nullable']
 				})
@@ -701,46 +807,26 @@ where kc.[type] = 'PK'
 		}
 	}
 
-	CompareColumns() {
-		#if ($this.SrcColumns.Count -lt $this.DstColumns.Count) {
-		#	Write-LogMessage -Message "The table [$($this.SchemaName)].[$($this.TableName)] schema is not the same on source and destination"
-		#	return $false
-		#}
-
-		foreach($s in $this.SrcColumns.GetEnumerator() | Select-Object -ExpandProperty Value) {
-			$d = $null
-			$b = $this.DstColumns.TryGetValue($s.Name, [ref]$d)
-			if ($b) {
-				if ($d.DataType -ne $s.DataType -or $d.Collation -ne $s.Collation `
-					-or $d.Computed -ne $s.Computed `
-					-or $d.Nullable -ne $s.Nullable) {
-					throw "The column [$($s.Name)] isn't the same in the source and destination table"
-				}
-			}
-			else {
-				#Write-LogMessage -Message "The column [$($s.Name)] doesn't exist in the destination table"
-				if (-not $s.Computed) {
-					$this.MissedColumns.Add($s)
-				}
-			}
-		}
-	}
-
 	[bool]AddMissedColumns() {
-		if ($this.MissedColumns.Count -eq 0) {
-			return $false
-		}
-
 		$query = [System.Text.StringBuilder]::new()
 		$query.Append("alter table [$($this.SchemaName)].[$($this.TableName)] add ")
 
-		foreach ($c in $this.MissedColumns) {
+		$hasMissed = $false
+		foreach($c in $this.SrcColumns.Values.Where({ -not $_.Computed })) {
+			if ($this.DstColumns.ContainsKey($c.Name)) {
+				continue
+			}
+
 			if ([string]::IsNullOrEmpty($c.Collation)) {
 				$query.Append("[$($c.Name)] $($c.DataType) null,")
 			}
 			else {
 				$query.Append("[$($c.Name)] $($c.DataType) collate $($c.Collation) null,")
 			}
+			$hasMissed = $true
+		}
+		if (-not $hasMissed) {
+			return $false
 		}
 		$query.Length -= 1
 
@@ -748,7 +834,6 @@ where kc.[type] = 'PK'
 		try {
 			$sqlCmd = [SqlCommand]::new($query.ToString(), $this.Group.DstSqlConn) 
 			$sqlCmd.ExecuteNonQuery()
-
 			return $true
 		}
 		finally {
@@ -762,30 +847,13 @@ where kc.[type] = 'PK'
 		$query = [System.Text.StringBuilder]::new()
 		$query.Append("set xact_abort on  begin tran create table [$($this.SchemaName)].[$($this.TableName)](")
 
-		#foreach ($c in $this.SrcColumns.Where({ -not $_.Computed })) {
-		foreach ($c in $this.SrcColumns.GetEnumerator() | Select-Object -ExpandProperty Value) {
+		foreach ($c in $this.SrcColumns.Values) {
 			$query.Append([Table]::GetColumnDefinition($c) + ',')
-			#if ([string]::IsNullOrEmpty($c.Collation)) {
-			#	$query.Append("[$($c.Name)] $($c.DataType) ")
-			#}
-			#else {
-			#	$query.Append("[$($c.Name)] $($c.DataType) collate $($c.Collation) ")
-			#}
-			#if ($c.Nullable) {
-			#	$query.Append('null,')
-			#}
-			#else {
-			#	$query.Append('not null,')
-			#}
 		}
 		$query.Length -= 1
 		$query.Append(') ')
 
-		#$pk = [Table]::GetTablePrimaryKeyIndex($this.SchemaName, $this.TableName, $this.Group.SrcSqlConn)
-		#$cl = [Table]::GetTableClusteredIndex($this.SchemaName, $this.TableName, $this.Group.SrcSqlConn)
-
 		if ($this.SrcPk.Name -ne $this.SrcCl.Name) {
-			#$columns = [Table]::GetTableClusteredColumns($this.SchemaName, $this.TableName, $this.Group.SrcSqlConn)
 			if ($this.SrcCl.Unique) {
 				$query.Append("create unique clustered ")
 			}
@@ -844,32 +912,26 @@ where kc.[type] = 'PK'
 		if (-not $this.Group.DisableFK) {
 			return
 		}
-
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_DisableEnableFK', $this.Group.ArcSqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.Id
-			$pDisable = $sqlCmd.Parameters.Add('@Disable', [System.Data.SqlDbType]::Bit)
-			$pDisable.Value = $disable
-
-			$sqlCmd.ExecuteNonQuery()
-
-			$this.FKDisabled = $disable
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_DisableEnableFK' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				Disable = @{
+					Value = $disable
+					Type  = [System.Data.SqlDbType]::Bit
+				}
 			}
-		}
+
+		$this.FKDisabled = $disable
 	}
 
 	DropWorkingTables() {
-		return
-		$sqlCmd = $null
-		try {
-			$query = @"
+		$query = @"
 if exists(	select	1
 			from	INFORMATION_SCHEMA.TABLES
 			where TABLE_NAME = '$($this.SrcWorkingTableName)' and TABLE_SCHEMA = 'dbo' and TABLE_TYPE = 'BASE TABLE')
@@ -884,14 +946,10 @@ begin
 	drop table dbo.[$($this.DstWorkingTableName)]
 end
 "@
-			$sqlCmd = [SqlCommand]::new($query, $this.Group.ArcSqlConn)
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.ArcSqlConn `
+			-Query $query `
 	}
 
 	CreateSourceWorkingTable() {
@@ -913,25 +971,13 @@ create table dbo.[$($this.SrcWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 				throw "Primary key column [$($pkc.Name)] not found for [$($this.SchemaName)].[$($this.TableName)] table"
 			}
 			$query.Append([Table]::GetColumnDefinition($c) + ',')
-			#if ([string]::IsNullOrEmpty($c.Collation)) {
-			#	$query.Append("[$($c.Name)] $($c.DataType) not null,")
-			#}
-			#else {
-			#	$query.Append("[$($c.Name)] $($c.DataType) collate $($c.Collation) not null,")
-			#}
 		}
 		$query.Length -= 1
 		$query.Append(')')
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query.ToString(), $this.Group.ArcSqlConn) 
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.ArcSqlConn `
+			-Query $query `
 	}
 
 	CreateDestinationWorkingTable() {
@@ -953,28 +999,23 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 				throw "Primary key column [$($pkc.Name)] not found for [$($this.SchemaName)].[$($this.TableName)] table"
 			}
 			$query.Append([Table]::GetColumnDefinition($c) + ',')
-			#if ([string]::IsNullOrEmpty($c.Collation)) {
-			#	$query.Append("[$($c.Name)] $($c.DataType) not null,")
-			#}
-			#else {
-			#	$query.Append("[$($c.Name)] $($c.DataType) collate $($c.Collation) not null,")
-			#}
 		}
 		$query.Length -= 1
 		$query.Append(')')
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query.ToString(), $this.Group.ArcSqlConn) 
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.ArcSqlConn `
+			-Query $query `
 	}
 
 	BulkCopySourcePK() {
+		<#
+		.SYNOPSIS
+		Copies primary keys from the source database to the working table
+
+		.DESCRIPTION
+		Copies primary keys from the source database to the working table using BulkCopy
+		#>
 		$sqlCmd = $null
 		$sqlReader = $null
 		$bulkCopy = $null
@@ -1015,6 +1056,14 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 	}
 
 	BulkCopyDestinationPK() {
+		<#
+		.SYNOPSIS
+		Copies primary keys from the destination database to the working table
+
+		.DESCRIPTION
+		Copies primary keys from the destination database to the working table using BulkCopy
+		#>
+
 		$sqlCmd = $null
 		$sqlReader = $null
 		$bulkCopy = $null
@@ -1083,10 +1132,8 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 				$localTable.State.SetRowsCopied($e.RowsCopied)
 			})
 
-			foreach ($c in $this.SrcColumns.GetEnumerator() | Select-Object -ExpandProperty Value) {
-				if (-not $c.Computed) {
-					[void]$bulkCopy.ColumnMappings.Add([SqlBulkCopyColumnMapping]::new($c.Name, $c.Name))
-				}
+			foreach ($c in $this.SrcColumns.Values.Where({ -not $_.Computed })) {
+				[void]$bulkCopy.ColumnMappings.Add([SqlBulkCopyColumnMapping]::new($c.Name, $c.Name))
 			}
 
 			$bulkCopy.WriteToServer($sqlReader)
@@ -1107,20 +1154,18 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 	}
 
 	PurgeData() {
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new('dbo.stp_PurgeData', $this.Group.ArcSqlConn) 
-			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pProcessStateId = $sqlCmd.Parameters.Add('@ProcessStateId', [System.Data.SqlDbType]::Int)
-			$pProcessStateId.Value = $this.State.Id
-
-			$this.State.RowsPurgedForBatch = [int]$sqlCmd.ExecuteScalar()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		$this.State.RowsPurgedForBatch = [int](Invoke-SimpleQuery `
+			-SqlConn $this.Group.ArcSqlConn `
+			-Query 'dbo.stp_PurgeData' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.State.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+			} `
+			-Scalar
+		)
 	}
 }
 
@@ -1130,7 +1175,9 @@ function Invoke-EasyArchiving {
 		[string]$ConnStr,
 
 		[parameter(Mandatory)]
-		[string]$GroupName
+		[string]$GroupName,
+
+		[string]$LogFile
 	)
 
 	Set-StrictMode -Version Latest
@@ -1141,73 +1188,83 @@ function Invoke-EasyArchiving {
 		if ($group.Id -eq 0) {
 			throw "Specified table group ($GroupName) not found"
 		}
-		Write-LogMessage -Message "Archive group ($GroupName) found"
+		Write-LogMessage -Message "Archive group ($GroupName) found" -LogFile $LogFile
 
 		$group.ReadSourceTables()
 
 		if ($group.SourceTables.Count -eq 0) {
-			Write-LogMessage -Message "No tables found for the specified table group ($GroupName)"
+			Write-LogMessage -Message "No tables found for the specified table group ($GroupName)" -LogFile $LogFile
 			return
 		}
-		Write-LogMessage -Message "$($group.SourceTables.Count) archive table(s) found"
+		Write-LogMessage -Message "$($group.SourceTables.Count) archive/purge table(s) found" -LogFile $LogFile
 
+		$b = $false
 		foreach ($table in $group.SourceTables) {
+			if (-not $table.Archive -and -not $table.Purge) {
+				Write-LogMessage -Message "Skipping table [$($table.SchemaName)].[$($table.TableName)] since it's not enabled for archiving and purging" `
+					-LogFile $LogFile
+				continue
+			}
 			if (-not ($table.IsTableExistsInSource())) {
-				throw "Error occurred. The source table [$($table.SchemaName)].[$($table.TableName)] doesn't exist"
+				throw "The source table [$($table.SchemaName)].[$($table.TableName)] doesn't exist"
 			}
-			Write-LogMessage -Message "Collecting columns info for source table [$($table.SchemaName)].[$($table.TableName)]"
 			$table.ReadSrcTableColumns()
-			Write-LogMessage -Message "Columns info collected for source table [$($table.SchemaName)].[$($table.TableName)]"
+			Write-LogMessage -Message "Columns info collected for source table [$($table.SchemaName)].[$($table.TableName)]" `
+				-LogFile $LogFile
 
-			if (-not $table.IsTableExistsInDestination()) {
-				if (-not $table.IsTableSchemaExistsInDestination()) {
-					Write-LogMessage -Message "The destination schema [$($table.SchemaName)] doesn't exist. Trying to create"
-					$table.CreateDestinationTableSchema()
+			if ($table.Archive) {
+				if (-not $table.IsTableExistsInDestination()) {
+					if (-not $table.IsTableSchemaExistsInDestination()) {
+						Write-LogMessage -Message "The destination schema [$($table.SchemaName)] doesn't exist. Creating..." `
+							-LogFile $LogFile
+						$table.CreateDestinationTableSchema()
+						Write-LogMessage -Message "The destination schema [$($table.SchemaName)] created" `
+							-LogFile $LogFile
+					}
+					Write-LogMessage -Message "The destination table [$($table.SchemaName)].[$($table.TableName)] doesn't exist. Creating..." `
+						-LogFile $LogFile
+					$table.CreateDestinationTable()
+					Write-LogMessage -Message "The destination table [$($table.SchemaName)].[$($table.TableName)] created" -LogFile $LogFile
 				}
-				Write-LogMessage -Message "The destination table [$($table.SchemaName)].[$($table.TableName)] doesn't exist. Trying to create"
-				$table.CreateDestinationTable()
-				Write-LogMessage -Message "The destination table [$($table.SchemaName)].[$($table.TableName)] created"
-			}
-			else {
-				Write-LogMessage -Message "Collecting columns info for destination table [$($table.SchemaName)].[$($table.TableName)]"
-				$table.ReadDstTableColumns()
-				Write-LogMessage -Message "Columns info collected for destination table [$($table.SchemaName)].[$($table.TableName)]"
+				else {
+					$table.ReadDstTableColumns()
+					Write-LogMessage -Message "Columns info collected for destination table [$($table.SchemaName)].[$($table.TableName)]" `
+						-LogFile $LogFile
 
-				$table.CompareColumns()
+					Compare-Columns -SrcColumns $table.SrcColumns -DstColumns $table.DstColumns -LogFile $LogFile
 
-				if ($table.AddMissedColumns()) {
-					Write-LogMessage -Message "Missed columns added to the [$($table.SchemaName)].[$($table.TableName)] table"
+					if ($table.AddMissedColumns()) {
+						Write-LogMessage -Message "Missed columns added to the [$($table.SchemaName)].[$($table.TableName)] table" `
+							-LogFile $LogFile
+					}
+
+					Write-LogMessage -Message "Schema comparision completed for the [$($table.SchemaName)].[$($table.TableName)] table" `
+						-LogFile $LogFile
 				}
-				Write-LogMessage -Message "Schema comparision passed for the table [$($table.SchemaName)].[$($table.TableName)]"
 			}
 
 			$table.GetState()
-			$copyPK = $true
 
-			# is it incomplete process?
 			if ($table.State.IncompleteProcess) {
-				Write-LogMessage -Message "Incomplete process found for the table [$($table.SchemaName)].[$($table.TableName)]"
-
-				# KeyCopyDate has value?
-				if ($table.State.IsKeysCopied()) {
-					$copyPK = $false
-				}
+				Write-LogMessage -Message "Incomplete process found for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					 -LogFile $LogFile
 			}
 			else {
-				# Create a new record in ProcessState
 				$table.State.Create()
-				$copyPK = $true
 			}
 
-			if ($copyPK) {
+			if (-not $table.State.IsKeysCopied()) {
 				# Create a working table
 				$table.CreateSourceWorkingTable()
-				Write-LogMessage -Message "Working table recreated for [$($table.SchemaName)].[$($table.TableName)]"
+				Write-LogMessage -Message "Working table created for [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
 
 				# Populate PK values from source and update KeyCopyDate
-				Write-LogMessage -Message "PK copy started for the table [$($table.SchemaName)].[$($table.TableName)]"
+				Write-LogMessage -Message "PK copy started for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
 				$table.BulkCopySourcePK()
-				Write-LogMessage -Message "PK values copied for the table [$($table.SchemaName)].[$($table.TableName)]"
+				Write-LogMessage -Message "PK values copied for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
 
 				$table.State.UpdateKeyMaxValue()
 				$table.State.UpdateKeyCopyDate()
@@ -1217,7 +1274,8 @@ function Invoke-EasyArchiving {
 				$table.CreateDestinationWorkingTable()
 				$table.BulkCopyDestinationPK()
 				$table.State.FixAndGetLastArchivedKey()
-				Write-LogMessage -Message "LastArchivedKey fixed for the table [$($table.SchemaName)].[$($table.TableName)]"
+				Write-LogMessage -Message "LastArchivedKey fixed for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					 -LogFile $LogFile
 			}
 			else {
 				$table.State.LastArchivedKey = 0
@@ -1225,26 +1283,33 @@ function Invoke-EasyArchiving {
 				$table.State.UpdateArchiveState()
 			}
 
-			Write-LogMessage -Message "Data copy started for the table [$($table.SchemaName)].[$($table.TableName)]"
-			while ($table.State.ArchiveProcessHasRowsForNextBatch()) {
-				$table.BulkCopyTable()
+			if ($table.Archive) {
+				Write-LogMessage -Message "Data copy started for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
+				while ($table.State.ArchiveProcessHasRowsForNextBatch()) {
+					$table.BulkCopyTable()
 
-				$table.State.LastArchivedKey += $table.DataCopyBatchSize
-				$table.State.RowsCopied += $table.State.RowsCopiedForBatch
-				$table.State.UpdateArchiveState()
-				if ($table.State.RowsCopiedForBatch -gt 0) {
-					Start-Sleep -Seconds $table.DelayIntervalInSeconds
+					$table.State.LastArchivedKey += $table.DataCopyBatchSize
+					$table.State.RowsCopied += $table.State.RowsCopiedForBatch
+					$table.State.UpdateArchiveState()
+					if ($table.State.RowsCopiedForBatch -gt 0) {
+						Start-Sleep -Seconds $table.DelayIntervalInSeconds
+					}
 				}
-			}
-			$table.State.UpdateArchiveState()
-			Write-LogMessage -Message "Data copy completed for the table [$($table.SchemaName)].[$($table.TableName)]"
+				$table.State.UpdateArchiveState()
+				Write-LogMessage -Message "Data copy completed for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
 
-			if (-not $table.Purge) {
-				$table.State.UpdateCompleteDate()
-				$table.DropWorkingTables()
+				if (-not $table.Purge) {
+					$table.State.UpdateCompleteDate()
+					$table.DropWorkingTables()
+				}
+				$b = $true
 			}
 		}
-		Write-LogMessage -Message "Archive process completed for the group ($($group.Name))"
+		if ($b) {
+			Write-LogMessage -Message "Archive process completed for the group ($($group.Name))" -LogFile $LogFile
+		}
 
 		# For each table in a group according to PurgeOrder
 		$b = $false
@@ -1255,7 +1320,8 @@ function Invoke-EasyArchiving {
 				$table.State.UpdatePurgeState()
 			}
 
-			Write-LogMessage -Message "Purge started for the table [$($table.SchemaName)].[$($table.TableName)]"
+			Write-LogMessage -Message "Purge started for the table [$($table.SchemaName)].[$($table.TableName)]" `
+				-LogFile $LogFile
 			while ($table.State.PurgeProcessHasRowsForNextBatch()) {
 				$table.DisableEnableFK($true)
 				$table.PurgeData()
@@ -1266,18 +1332,20 @@ function Invoke-EasyArchiving {
 				$table.State.UpdatePurgeState()
 				Start-Sleep -s $table.DelayIntervalInSeconds
 			}
-			Write-LogMessage -Message "Purge completed for the table [$($table.SchemaName)].[$($table.TableName)]"
+			Write-LogMessage -Message "Purge completed for the table [$($table.SchemaName)].[$($table.TableName)]" `
+				-LogFile $LogFile
 
 			$table.State.UpdateCompleteDate()
 			$table.DropWorkingTables()
 			$b = $true
 		}
 		if ($b) {
-			Write-LogMessage -Message "Purge process completed for the group ($($group.Name))"
+			Write-LogMessage -Message "Purge process completed for the group ($($group.Name))" -LogFile $LogFile
 		}
 	}
 	catch {
-		Write-LogMessage -Message $_.Exception.ToString()
+		Write-LogMessage -Message $_.Exception.ToString() -LogFile $LogFile `
+			-Level Error
 		throw
 	}
 	finally {
