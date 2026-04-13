@@ -95,11 +95,11 @@ begin
 		KeyMaxValue			int null,
 
 		LastArchivedKey		int null,			-- last copied surrogate primary key
-		LastArchivedDate	datetime2(7) null,	-- date of the last copy
-		RowsCopied			int null,			-- rows count
+		ArchiveCompleteDate	datetime2(7) null,	-- archiving complete date
+		RowsArchived		int null,			-- rows count
 
 		LastPurgedKey		int null,			-- last purged surrogate primary key
-		LastPurgedDate		datetime2(7) null,	-- date of the last purge
+		PurgeCompleteDate	datetime2(7) null,	-- purging complete date
 		RowsPurged			int null,			-- rows count
 
 		CompleteDate		datetime2(7) null

@@ -70,8 +70,14 @@ function Compare-Columns {
 			}
 		}
 		else {
-			Write-LogMessage -Message "Column [$($srcColumn.Name)] doesn't exist in the destination table" `
-				-LogFile $LogFile
+			if ($srcColumn.Computed) {
+				Write-LogMessage -Message "Computed column [$($srcColumn.Name)] doesn't exist in the destination table" `
+					-LogFile $LogFile
+			}
+			else {
+				Write-LogMessage -Message "Column [$($srcColumn.Name)] doesn't exist in the destination table" `
+					-LogFile $LogFile
+			}
 		}
 	}
 }
@@ -286,18 +292,18 @@ class ProcessState {
 	[int]$KeyMaxValue
 
 	[int]$LastArchivedKey
-	[DateTime]$LastArchivedDate
-	[int]$RowsCopied
+	[DateTime]$ArchiveCompleteDate
+	[int]$RowsArchived
 
 	[int]$LastPurgedKey
-	[DateTime]$LastPurgedDate
+	[DateTime]$PurgeCompleteDate
 	[int]$RowsPurged
 
 	[DateTime]$CompleteDate
 
 	[bool]$IncompleteProcess
 
-	[int]$RowsCopiedForBatch
+	[int]$RowsArchivedForBatch
 	[int]$RowsPurgedForBatch
 
 	[SqlConnection]$ArcSqlConn
@@ -351,6 +357,31 @@ class ProcessState {
 			}
 	}
 
+	UpdateArchiveComplete() {
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastArchivedKey = @{
+					Value = $this.LastArchivedKey
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				RowsArchived = @{
+					Value = $this.RowsArchived
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				ArchiveCompleteDate = @{
+					Value = [DateTime]::Now
+					Type  = [System.Data.SqlDbType]::DateTime
+				}
+			}
+	}
+
 	UpdateArchiveState() {
 		Invoke-SimpleQuery `
 			-SqlConn $this.ArcSqlConn `
@@ -365,11 +396,32 @@ class ProcessState {
 					Value = $this.LastArchivedKey
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				RowsCopied = @{
-					Value = $this.RowsCopied
+				RowsArchived = @{
+					Value = $this.RowsArchived
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				LastArchivedDate = @{
+			}
+	}
+
+	UpdatePurgeComplete() {
+		Invoke-SimpleQuery `
+			-SqlConn $this.ArcSqlConn `
+			-Query 'dbo.stp_UpdateProcessState' `
+			-CommandType StoredProcedure `
+			-Parameters @{
+				ProcessStateId = @{
+					Value = $this.Id
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				LastPurgedKey = @{
+					Value = $this.LastPurgedKey
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				RowsPurged = @{
+					Value = $this.RowsPurged
+					Type  = [System.Data.SqlDbType]::Int
+				}
+				PurgeCompleteDate = @{
 					Value = [DateTime]::Now
 					Type  = [System.Data.SqlDbType]::DateTime
 				}
@@ -393,10 +445,6 @@ class ProcessState {
 				RowsPurged = @{
 					Value = $this.RowsPurged
 					Type  = [System.Data.SqlDbType]::Int
-				}
-				LastPurgedDate = @{
-					Value = [DateTime]::Now
-					Type  = [System.Data.SqlDbType]::DateTime
 				}
 			}
 	}
@@ -427,12 +475,12 @@ class ProcessState {
 		return ($this.LastPurgedKey -lt $this.KeyMaxValue)
 	}
 
-	[bool]IsKeysCopied() {
+	[bool]IsPkCopied() {
 		return ($this.KeyCopyDate -ne [DateTime]::MinValue)
 	}
 
-	FixAndGetLastArchivedKey() {
-		$this.LastArchivedKey = [int](Invoke-SimpleQuery `
+	[bool]FixAndGetLastArchivedKey() {
+		$newLastArchivedKey = [int](Invoke-SimpleQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_FixLastArchivedKey' `
 			-CommandType StoredProcedure `
@@ -444,10 +492,15 @@ class ProcessState {
 			} `
 			-Scalar
 		)
+		if ($this.LastArchivedKey -ne $newLastArchivedKey) {
+			$this.LastArchivedKey = $newLastArchivedKey
+			return $true
+		}
+		return $false
 	}
 
-	SetRowsCopied($count) {
-		$this.RowsCopiedForBatch = [int]$count
+	SetBulkRowsCopied($count) {
+		$this.RowsArchivedForBatch = [int]$count
 	}
 }
 
@@ -496,7 +549,7 @@ class Table {
 
 			$sqlCmd = [SqlCommand]::new('dbo.stp_GetIncompleteProcessState', $this.Group.ArcSqlConn) 
 			$sqlCmd.CommandType = [System.Data.CommandType]::StoredProcedure
-			$pSourceTableId = $sqlCmd.Parameters.Add('@SourceTableId', [System.Data.SqlDbType]::NVarChar, 128)
+			$pSourceTableId = $sqlCmd.Parameters.Add('@SourceTableId', [System.Data.SqlDbType]::Int, 128)
 			$pSourceTableId.Value = $this.Id
 
 			$sqlReader = $sqlCmd.ExecuteReader()
@@ -513,17 +566,17 @@ class Table {
 				if ($sqlReader['LastArchivedKey'] -isnot [System.DBNull]) {
 					$this.State.LastArchivedKey = $sqlReader['LastArchivedKey']
 				}
-				if ($sqlReader['LastArchivedDate'] -isnot [System.DBNull]) {
-					$this.State.LastArchivedDate = $sqlReader['LastArchivedDate']
+				if ($sqlReader['ArchiveCompleteDate'] -isnot [System.DBNull]) {
+					$this.State.ArchiveCompleteDate = $sqlReader['ArchiveCompleteDate']
 				}
-				if ($sqlReader['RowsCopied'] -isnot [System.DBNull]) {
-					$this.State.RowsCopied = $sqlReader['RowsCopied']
+				if ($sqlReader['RowsArchived'] -isnot [System.DBNull]) {
+					$this.State.RowsArchived = $sqlReader['RowsArchived']
 				}
 				if ($sqlReader['LastPurgedKey'] -isnot [System.DBNull]) {
 					$this.State.LastPurgedKey = $sqlReader['LastPurgedKey']
 				}
-				if ($sqlReader['LastPurgedDate'] -isnot [System.DBNull]) {
-					$this.State.LastPurgedDate = $sqlReader['LastPurgedDate']
+				if ($sqlReader['PurgeCompleteDate'] -isnot [System.DBNull]) {
+					$this.State.PurgeCompleteDate = $sqlReader['PurgeCompleteDate']
 				}
 				if ($sqlReader['RowsPurged'] -isnot [System.DBNull]) {
 					$this.State.RowsPurged = $sqlReader['RowsPurged']
@@ -816,7 +869,7 @@ where kc.[type] = 'PK'
 			if ($this.DstColumns.ContainsKey($c.Name)) {
 				continue
 			}
-
+			# missed columns are ALWAYS nullable
 			if ([string]::IsNullOrEmpty($c.Collation)) {
 				$query.Append("[$($c.Name)] $($c.DataType) null,")
 			}
@@ -830,17 +883,10 @@ where kc.[type] = 'PK'
 		}
 		$query.Length -= 1
 
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query.ToString(), $this.Group.DstSqlConn) 
-			$sqlCmd.ExecuteNonQuery()
-			return $true
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.DstSqlConn `
+			-Query $query.ToString()
+		return $true
 	}
 
 	CreateDestinationTable() {
@@ -882,30 +928,17 @@ where kc.[type] = 'PK'
 			$query.Append(') ')
 		}
 		$query.Append('commit tran')
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query.ToString(), $this.Group.DstSqlConn) 
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.DstSqlConn `
+			-Query $query.ToString()
 	}
 
 	CreateDestinationTableSchema() {
 		$query = "create schema [$($this.SchemaName)]"
-		$sqlCmd = $null
-		try {
-			$sqlCmd = [SqlCommand]::new($query, $this.Group.DstSqlConn) 
-			$sqlCmd.ExecuteNonQuery()
-		}
-		finally {
-			if ($sqlCmd) {
-				$sqlCmd.Dispose()
-			}
-		}
+		Invoke-SimpleQuery `
+			-SqlConn $this.Group.DstSqlConn `
+			-Query $query.ToString()
 	}
 
 	DisableEnableFK($disable) {
@@ -1125,11 +1158,12 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 
 			$bulkCopy.DestinationTableName = "[$($this.SchemaName)].[$($this.TableName)]"
 			$bulkCopy.EnableStreaming = $true
+			$bulkCopy.BatchSize = $this.DataCopyBatchSize
 			$bulkCopy.NotifyAfter = $this.DataCopyBatchSize / 10
 			$localTable = $this
 			$bulkCopy.add_SqlRowsCopied({
 				param($s, $e)
-				$localTable.State.SetRowsCopied($e.RowsCopied)
+				$localTable.State.SetBulkRowsCopied($e.RowsCopied)
 			})
 
 			foreach ($c in $this.SrcColumns.Values.Where({ -not $_.Computed })) {
@@ -1234,7 +1268,7 @@ function Invoke-EasyArchiving {
 					Compare-Columns -SrcColumns $table.SrcColumns -DstColumns $table.DstColumns -LogFile $LogFile
 
 					if ($table.AddMissedColumns()) {
-						Write-LogMessage -Message "Missed columns added to the [$($table.SchemaName)].[$($table.TableName)] table" `
+						Write-LogMessage -Message "Missing column(s) added to the [$($table.SchemaName)].[$($table.TableName)] table" `
 							-LogFile $LogFile
 					}
 
@@ -1253,7 +1287,7 @@ function Invoke-EasyArchiving {
 				$table.State.Create()
 			}
 
-			if (-not $table.State.IsKeysCopied()) {
+			if (-not $table.State.IsPkCopied()) {
 				# Create a working table
 				$table.CreateSourceWorkingTable()
 				Write-LogMessage -Message "Working table created for [$($table.SchemaName)].[$($table.TableName)]" `
@@ -1272,33 +1306,47 @@ function Invoke-EasyArchiving {
 
 			if ($table.State.IncompleteProcess -or $table.AlwaysRunCheck) {
 				$table.CreateDestinationWorkingTable()
-				$table.BulkCopyDestinationPK()
-				$table.State.FixAndGetLastArchivedKey()
-				Write-LogMessage -Message "LastArchivedKey fixed for the table [$($table.SchemaName)].[$($table.TableName)]" `
-					 -LogFile $LogFile
+				# Only copy if there is a data in the source table
+				if ($table.State.KeyMaxValue -ne 0) {
+					$table.BulkCopyDestinationPK()
+				}
+				if ($table.State.FixAndGetLastArchivedKey()) {
+					Write-LogMessage -Message "LastArchivedKey fixed for the table [$($table.SchemaName)].[$($table.TableName)]" `
+						-LogFile $LogFile
+				}
 			}
 			else {
 				$table.State.LastArchivedKey = 0
-				$table.State.RowsCopied = 0
+				$table.State.RowsArchived = 0
 				$table.State.UpdateArchiveState()
 			}
 
 			if ($table.Archive) {
-				Write-LogMessage -Message "Data copy started for the table [$($table.SchemaName)].[$($table.TableName)]" `
+				Write-LogMessage -Message "Archiving started for the table [$($table.SchemaName)].[$($table.TableName)]" `
 					-LogFile $LogFile
+				
+				$rowsArchivedPerRun = 0
 				while ($table.State.ArchiveProcessHasRowsForNextBatch()) {
 					$table.BulkCopyTable()
 
 					$table.State.LastArchivedKey += $table.DataCopyBatchSize
-					$table.State.RowsCopied += $table.State.RowsCopiedForBatch
+					$table.State.RowsArchived += $table.State.RowsArchivedForBatch
+					$rowsArchivedPerRun += $table.State.RowsArchivedForBatch
 					$table.State.UpdateArchiveState()
-					if ($table.State.RowsCopiedForBatch -gt 0) {
+					if ($table.State.RowsArchivedForBatch -gt 0) {
 						Start-Sleep -Seconds $table.DelayIntervalInSeconds
 					}
 				}
-				$table.State.UpdateArchiveState()
-				Write-LogMessage -Message "Data copy completed for the table [$($table.SchemaName)].[$($table.TableName)]" `
-					-LogFile $LogFile
+				$table.State.UpdateArchiveComplete()
+				if ($table.State.RowsArchived -gt 0) {
+					$message = "Archiving completed for the table [$($table.SchemaName)].[$($table.TableName)]. " +
+						"Rows archived (now): $rowsArchivedPerRun. Rows archived (state): $($table.State.RowsArchived)"
+					Write-LogMessage -Message $message -LogFile $LogFile
+				}
+				else {
+					Write-LogMessage -Message "There was no data to archive for the table [$($table.SchemaName)].[$($table.TableName)]" `
+						-LogFile $LogFile
+				}
 
 				if (-not $table.Purge) {
 					$table.State.UpdateCompleteDate()
@@ -1308,7 +1356,7 @@ function Invoke-EasyArchiving {
 			}
 		}
 		if ($b) {
-			Write-LogMessage -Message "Archive process completed for the group ($($group.Name))" -LogFile $LogFile
+			Write-LogMessage -Message "Archiving process completed for the group ($($group.Name))" -LogFile $LogFile
 		}
 
 		# For each table in a group according to PurgeOrder
@@ -1320,27 +1368,36 @@ function Invoke-EasyArchiving {
 				$table.State.UpdatePurgeState()
 			}
 
-			Write-LogMessage -Message "Purge started for the table [$($table.SchemaName)].[$($table.TableName)]" `
+			Write-LogMessage -Message "Purging started for the table [$($table.SchemaName)].[$($table.TableName)]" `
 				-LogFile $LogFile
-			while ($table.State.PurgeProcessHasRowsForNextBatch()) {
-				$table.DisableEnableFK($true)
-				$table.PurgeData()
-				$table.DisableEnableFK($false)
 
-				$table.State.LastPurgedKey = $table.State.LastPurgedKey + $table.DataCopyBatchSize
-				$table.State.RowsPurged = $table.State.RowsPurged + $table.State.RowsPurgedForBatch
+			$rowsPurgedPerRun = 0
+			$table.DisableEnableFK($true)
+			while ($table.State.PurgeProcessHasRowsForNextBatch()) {
+				$table.PurgeData()
+				$table.State.LastPurgedKey += $table.PurgeBatchSize
+				$table.State.RowsPurged += $table.State.RowsPurgedForBatch
+				$rowsPurgedPerRun += $table.State.RowsPurgedForBatch
 				$table.State.UpdatePurgeState()
 				Start-Sleep -s $table.DelayIntervalInSeconds
 			}
-			Write-LogMessage -Message "Purge completed for the table [$($table.SchemaName)].[$($table.TableName)]" `
-				-LogFile $LogFile
+			$table.DisableEnableFK($false)
+			$table.State.UpdatePurgeComplete()
+			if ($table.State.RowsPurged -gt 0) {
+				$message = "Purging completed for the table [$($table.SchemaName)].[$($table.TableName)]. " +
+					"Rows purged (now): $rowsPurgedPerRun. Rows purged (state): $($table.State.RowsPurged)"
+				Write-LogMessage -Message $message -LogFile $LogFile
+			}
+			else {
+				Write-LogMessage -Message "There was no data to purge for the table [$($table.SchemaName)].[$($table.TableName)]" `
+					-LogFile $LogFile
+			}
 
 			$table.State.UpdateCompleteDate()
 			$table.DropWorkingTables()
-			$b = $true
 		}
 		if ($b) {
-			Write-LogMessage -Message "Purge process completed for the group ($($group.Name))" -LogFile $LogFile
+			Write-LogMessage -Message "Purging completed for the group ($($group.Name))" -LogFile $LogFile
 		}
 	}
 	catch {

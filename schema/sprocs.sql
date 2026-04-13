@@ -80,10 +80,10 @@ select top 1 ProcessStateId,
 		KeyCopyDate,
 		KeyMaxValue,
 		LastArchivedKey,
-		LastArchivedDate,
-		RowsCopied,
+		ArchiveCompleteDate,
+		RowsArchived,
 		LastPurgedKey,
-		LastPurgedDate,
+		PurgeCompleteDate,
 		RowsPurged
 from	dbo.ProcessState
 where SourceTableId = @SourceTableId and CompleteDate is null
@@ -100,10 +100,10 @@ alter procedure dbo.stp_UpdateProcessState
 	@KeyCopyDate		datetime2(7) = null,
 	@KeyMaxValue		int = null,
 	@LastArchivedKey	int = null,
-	@LastArchivedDate	datetime2(7) = null,
-	@RowsCopied			int = null,
+	@ArchiveCompleteDate	datetime2(7) = null,
+	@RowsArchived			int = null,
 	@LastPurgedKey		int = null,
-	@LastPurgedDate		datetime2(7) = null,
+	@PurgeCompleteDate	datetime2(7) = null,
 	@RowsPurged			int = null,
 	@CompleteDate		datetime2(7) = null
 as
@@ -113,10 +113,10 @@ update	dbo.ProcessState
 set		KeyCopyDate = isnull(@KeyCopyDate, KeyCopyDate),
 		KeyMaxValue = isnull(@KeyMaxValue, KeyMaxValue),
 		LastArchivedKey = isnull(@LastArchivedKey, LastArchivedKey),
-		LastArchivedDate = isnull(@LastArchivedDate, LastArchivedDate),
-		RowsCopied = isnull(@RowsCopied, RowsCopied),
+		ArchiveCompleteDate = isnull(@ArchiveCompleteDate, ArchiveCompleteDate),
+		RowsArchived = isnull(@RowsArchived, RowsArchived),
 		LastPurgedKey = isnull(@LastPurgedKey, LastPurgedKey),
-		LastPurgedDate = isnull(@LastPurgedDate, LastPurgedDate),
+		PurgeCompleteDate = isnull(@PurgeCompleteDate, PurgeCompleteDate),
 		RowsPurged = isnull(@RowsPurged, RowsPurged),
 		CompleteDate = isnull(@CompleteDate, CompleteDate),
 		ModifyDate = sysutcdatetime()
@@ -359,7 +359,8 @@ as
 set nocount on
 
 declare @SchemaName sysname, @TableName sysname, @SrcWorkingTableName sysname, @DstWorkingTableName sysname
-declare @WorkingTableKeyName sysname, @WorkingTableFlagName sysname, @LastArchivedKey int, @KeyMaxValue int
+declare @WorkingTableKeyName sysname, @WorkingTableFlagName sysname, @KeyMaxValue int
+declare @CurrentLastArchivedKey int, @NewLastArchivedKey int
 declare @Query nvarchar(max), @JoinColumns nvarchar(max)
 
 select	@SchemaName = ta.SchemaName,
@@ -368,6 +369,7 @@ select	@SchemaName = ta.SchemaName,
 		@DstWorkingTableName = ta.DstWorkingTableName,
 		@WorkingTableKeyName = ta.WorkingTableKeyName,
 		@WorkingTableFlagName = ta.WorkingTableFlagName,
+		@CurrentLastArchivedKey = ast.LastArchivedKey,
 		@KeyMaxValue = ast.KeyMaxValue
 from	dbo.ProcessState ast
 		join dbo.SourceTable ta
@@ -401,7 +403,7 @@ from	dbo.[' + @SrcWorkingTableName + '] so
 		join dbo.[' + @DstWorkingTableName + '] de
 		on ' + @JoinColumns + '
 
-select	@LastArchivedKey = min([' + @WorkingTableKeyName + ']) - 1
+select	@NewLastArchivedKey = min([' + @WorkingTableKeyName + ']) - 1
 from	dbo.[' + @SrcWorkingTableName + ']
 where [' + @WorkingTableFlagName + '] = 0'
 if @Query is null
@@ -412,16 +414,19 @@ if @Debug = 1
 begin
 	print @Query
 end
-exec sp_executesql @Query, N'@LastArchivedKey int output', @LastArchivedKey = @LastArchivedKey output
+exec sp_executesql @Query, N'@NewLastArchivedKey int output', @NewLastArchivedKey = @NewLastArchivedKey output
 
-set @LastArchivedKey = isnull(@LastArchivedKey, @KeyMaxValue)
+set @NewLastArchivedKey = isnull(@NewLastArchivedKey, @KeyMaxValue)
 
-update	dbo.ProcessState
-set		LastArchivedKey = @LastArchivedKey,
-		ModifyDate = sysutcdatetime()
-where ProcessStateId = @ProcessStateId
+if @NewLastArchivedKey <> @CurrentLastArchivedKey or @CurrentLastArchivedKey is null
+begin
+	update	dbo.ProcessState
+	set		LastArchivedKey = @NewLastArchivedKey,
+			ModifyDate = sysutcdatetime()
+	where ProcessStateId = @ProcessStateId
+end
 
-select @LastArchivedKey LastArchivedKey
+select @NewLastArchivedKey LastArchivedKey
 go
 
 if not exists (select 1 from INFORMATION_SCHEMA.ROUTINES where ROUTINE_NAME = 'stp_DisableEnableFK' and ROUTINE_SCHEMA = 'dbo' and ROUTINE_TYPE = 'PROCEDURE')
