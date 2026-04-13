@@ -60,8 +60,8 @@ begin
 
 		SrcWorkingTableName as SchemaName + '_' + TableName + '__src',	-- working table name for source primary keys
 		DstWorkingTableName as SchemaName + '_' + TableName + '__dst',	-- working table name for destination primary keys
-		WorkingTableKeyName as TableName + '__key',
-		WorkingTableFlagName as TableName + '__skip'	-- 0 - ok, 1 - means row is duplicate and must be skipped
+		WorkingTableKeyName as TableName + '__key',		-- working table PK column name
+		WorkingTableFlagName as TableName + '__skip'	-- 0 - ok, 1 - means row is already copied and must be skipped
 	)
 
 	alter table dbo.SourceTable add constraint PK_SourceTable primary key clustered (SourceTableId)

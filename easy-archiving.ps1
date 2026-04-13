@@ -12,10 +12,10 @@ function Write-LogMessage {
 	$line = "$((Get-Date).ToString('[MM/dd/yy HH:mm:ss.ff]')) [$Level] $Message"
 
 	if ($Level -eq 'Warning') {
-		Write-Warning $Message
+		Write-Warning $line
 	}
 	elseif ($Level -eq 'Error') {
-		Write-Error $Message
+		Write-Error $line
 	}
 	else {
 		Write-Verbose $line
@@ -72,7 +72,7 @@ function Compare-Columns {
 		else {
 			if ($srcColumn.Computed) {
 				Write-LogMessage -Message "Computed column [$($srcColumn.Name)] doesn't exist in the destination table" `
-					-LogFile $LogFile
+					-LogFile $LogFile -Level Warning
 			}
 			else {
 				Write-LogMessage -Message "Column [$($srcColumn.Name)] doesn't exist in the destination table" `
@@ -82,7 +82,7 @@ function Compare-Columns {
 	}
 }
 
-function Invoke-SimpleQuery {
+function Invoke-EasySqlQuery {
 	param (
 		[Parameter(Mandatory)]
 		[SqlConnection]$SqlConn,
@@ -100,32 +100,36 @@ function Invoke-SimpleQuery {
 
 	if ($Parameters) {
 		foreach ($name in $Parameters.Keys) {
-			$paramValue = $Parameters[$name]
-			if ($paramValue -isnot [hashtable] -and -not $paramValue.ContainsKey('Value')) {
-				throw 'Invalid Parameters value'
+			$param = $Parameters[$name]
+
+			if ($param -isnot [EasySqlParam]) {
+				throw "Parameter '$name' must be of type SqlParam"
 			}
 
-			$type = $paramValue.Type
-			if (-not $type) {
-				throw 'Parameter type not specified'
+			if (-not $param.Type) {
+				throw "Parameter '$name' must have Type specified"
 			}
-			$sqlParam = $sqlCmd.Parameters.Add("@$name", $type)
+			
+			$sqlParam = $sqlCmd.Parameters.Add("@$name", $param.Type)
 
-			if ($paramValue.ContainsKey('Size')) {
-				$sqlParam.Size = $paramValue.Size
+			if ($param.Size -gt 0) {
+				$sqlParam.Size = $param.Size
 			}
-			if ($paramValue.ContainsKey('Precision')) {
-				$sqlParam.Precision = $paramValue.Precision
+			if ($param.Precision -gt 0) {
+				$sqlParam.Precision = $param.Precision
 			}
-			if ($paramValue.ContainsKey('Scale')) {
-				$sqlParam.Scale = $paramValue.Scale
+			if ($param.Scale -gt 0) {
+				$sqlParam.Scale = $param.Scale
 			}
 
-			$value = $paramValue.Value
-			$sqlParam.Value = if ($null -eq $value) { [DBNull]::Value } else { $value }
+			$sqlParam.Value = if ($null -eq $param.Value) {
+				[DBNull]::Value
+			}
+			else {
+				$param.Value
+			}
 		}
 	}
-
 	try {
 		if ($Scalar) {
 			return $sqlCmd.ExecuteScalar()
@@ -135,8 +139,18 @@ function Invoke-SimpleQuery {
 		}
 	}
 	finally {
-		$sqlCmd.Dispose()
+		if ($null -ne $sqlCmd) {
+			$sqlCmd.Dispose()
+		}
 	}
+}
+
+class EasySqlParam {
+	[object]$Value
+	[System.Data.SqlDbType]$Type
+	[int]$Size
+	[byte]$Precision
+	[byte]$Scale
 }
 
 class TableColumn {
@@ -221,11 +235,11 @@ class TableGroup : System.IDisposable {
 			}
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -266,11 +280,11 @@ class TableGroup : System.IDisposable {
 			}
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -309,12 +323,12 @@ class ProcessState {
 	[SqlConnection]$ArcSqlConn
 
 	UpdateKeyMaxValue() {
-		$this.KeyMaxValue = [int](Invoke-SimpleQuery `
+		$this.KeyMaxValue = [int](Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateKeyMaxValue' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -324,16 +338,16 @@ class ProcessState {
 	}
 
 	UpdateKeyCopyDate() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				KeyCopyDate = @{
+				KeyCopyDate = [EasySqlParam]@{
 					Value = [DateTime]::Now
 					Type  = [System.Data.SqlDbType]::DateTime
 				}
@@ -341,16 +355,16 @@ class ProcessState {
 	}
 
 	UpdateCompleteDate() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				CompleteDate = @{
+				CompleteDate = [EasySqlParam]@{
 					Value = [DateTime]::Now
 					Type  = [System.Data.SqlDbType]::DateTime
 				}
@@ -358,24 +372,24 @@ class ProcessState {
 	}
 
 	UpdateArchiveComplete() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				LastArchivedKey = @{
+				LastArchivedKey = [EasySqlParam]@{
 					Value = $this.LastArchivedKey
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				RowsArchived = @{
+				RowsArchived = [EasySqlParam]@{
 					Value = $this.RowsArchived
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				ArchiveCompleteDate = @{
+				ArchiveCompleteDate = [EasySqlParam]@{
 					Value = [DateTime]::Now
 					Type  = [System.Data.SqlDbType]::DateTime
 				}
@@ -383,20 +397,20 @@ class ProcessState {
 	}
 
 	UpdateArchiveState() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				LastArchivedKey = @{
+				LastArchivedKey = [EasySqlParam]@{
 					Value = $this.LastArchivedKey
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				RowsArchived = @{
+				RowsArchived = [EasySqlParam]@{
 					Value = $this.RowsArchived
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -404,24 +418,24 @@ class ProcessState {
 	}
 
 	UpdatePurgeComplete() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				LastPurgedKey = @{
+				LastPurgedKey = [EasySqlParam]@{
 					Value = $this.LastPurgedKey
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				RowsPurged = @{
+				RowsPurged = [EasySqlParam]@{
 					Value = $this.RowsPurged
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				PurgeCompleteDate = @{
+				PurgeCompleteDate = [EasySqlParam]@{
 					Value = [DateTime]::Now
 					Type  = [System.Data.SqlDbType]::DateTime
 				}
@@ -429,20 +443,20 @@ class ProcessState {
 	}
 
 	UpdatePurgeState() {
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_UpdateProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				LastPurgedKey = @{
+				LastPurgedKey = [EasySqlParam]@{
 					Value = $this.LastPurgedKey
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				RowsPurged = @{
+				RowsPurged = [EasySqlParam]@{
 					Value = $this.RowsPurged
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -453,12 +467,12 @@ class ProcessState {
 		if ($this.Id -ne 0) {
 			throw 'State.Id already has a value'
 		}
-		$this.Id = [int](Invoke-SimpleQuery `
+		$this.Id = [int](Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_InsertProcessState' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				SourceTableId = @{
+				SourceTableId = [EasySqlParam]@{
 					Value = $this.SourceTableId
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -480,12 +494,12 @@ class ProcessState {
 	}
 
 	[bool]FixAndGetLastArchivedKey() {
-		$newLastArchivedKey = [int](Invoke-SimpleQuery `
+		$newLastArchivedKey = [int](Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_FixLastArchivedKey' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -586,11 +600,11 @@ class Table {
 			}
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -623,16 +637,16 @@ select	case when exists
 			else 0
 		end v
 '@
-		return [bool](Invoke-SimpleQuery `
+		return [bool](Invoke-EasySqlQuery `
 			-SqlConn $sqlConnection `
 			-Query $query `
 			-Parameters @{
-				SchemaName = @{
+				SchemaName = [EasySqlParam]@{
 					Value = $schemaName
 					Type  = [System.Data.SqlDbType]::NVarChar
 					Size  = 128
 				}
-				TableName = @{
+				TableName = [EasySqlParam]@{
 					Value = $tableName
 					Type  = [System.Data.SqlDbType]::NVarChar
 					Size  = 128
@@ -647,11 +661,11 @@ select	case when exists
 set nocount on
 select case when exists (select	1 from sys.schemas where [name] = @SchemaName) then 1 else 0 end v
 '@
-		return [bool](Invoke-SimpleQuery `
+		return [bool](Invoke-EasySqlQuery `
 			-SqlConn $sqlConnection `
 			-Query $query `
 			-Parameters @{
-				SchemaName = @{
+				SchemaName = [EasySqlParam]@{
 					Value = $schemaName
 					Type  = [System.Data.SqlDbType]::NVarChar
 					Size  = 128
@@ -727,11 +741,11 @@ where TABLE_SCHEMA = @SchemaName and TABLE_NAME = @TableName
 			return $columns
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -795,11 +809,11 @@ where kc.[type] = 'PK'
 			return $columns
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -850,11 +864,11 @@ where kc.[type] = 'PK'
 			return $null
 		}
 		finally {
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -883,7 +897,7 @@ where kc.[type] = 'PK'
 		}
 		$query.Length -= 1
 
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.DstSqlConn `
 			-Query $query.ToString()
 		return $true
@@ -929,14 +943,14 @@ where kc.[type] = 'PK'
 		}
 		$query.Append('commit tran')
 
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.DstSqlConn `
 			-Query $query.ToString()
 	}
 
 	CreateDestinationTableSchema() {
 		$query = "create schema [$($this.SchemaName)]"
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.DstSqlConn `
 			-Query $query.ToString()
 	}
@@ -945,16 +959,16 @@ where kc.[type] = 'PK'
 		if (-not $this.Group.DisableFK) {
 			return
 		}
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.ArcSqlConn `
 			-Query 'dbo.stp_DisableEnableFK' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
-				Disable = @{
+				Disable = [EasySqlParam]@{
 					Value = $disable
 					Type  = [System.Data.SqlDbType]::Bit
 				}
@@ -980,7 +994,7 @@ begin
 end
 "@
 
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.ArcSqlConn `
 			-Query $query `
 	}
@@ -1008,7 +1022,7 @@ create table dbo.[$($this.SrcWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 		$query.Length -= 1
 		$query.Append(')')
 
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.ArcSqlConn `
 			-Query $query `
 	}
@@ -1036,7 +1050,7 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 		$query.Length -= 1
 		$query.Append(')')
 
-		Invoke-SimpleQuery `
+		Invoke-EasySqlQuery `
 			-SqlConn $this.Group.ArcSqlConn `
 			-Query $query `
 	}
@@ -1074,15 +1088,15 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 			$bulkCopy.WriteToServer($sqlReader)
 		}
 		finally {
-			if ($bulkCopy) {
+			if ($null -ne $bulkCopy) {
 				$bulkCopy.Close()
 				$bulkCopy.Dispose()
 			}
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -1122,15 +1136,15 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 			$bulkCopy.WriteToServer($sqlReader)
 		}
 		finally {
-			if ($bulkCopy) {
+			if ($null -ne $bulkCopy) {
 				$bulkCopy.Close()
 				$bulkCopy.Dispose()
 			}
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
@@ -1159,7 +1173,7 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 			$bulkCopy.DestinationTableName = "[$($this.SchemaName)].[$($this.TableName)]"
 			$bulkCopy.EnableStreaming = $true
 			$bulkCopy.BatchSize = $this.DataCopyBatchSize
-			$bulkCopy.NotifyAfter = $this.DataCopyBatchSize / 10
+			$bulkCopy.NotifyAfter = [Math]::Max(1, [int]($this.DataCopyBatchSize / 10))
 			$localTable = $this
 			$bulkCopy.add_SqlRowsCopied({
 				param($s, $e)
@@ -1173,27 +1187,27 @@ create table dbo.[$($this.DstWorkingTableName)] ([$($this.WorkingTableKeyName)] 
 			$bulkCopy.WriteToServer($sqlReader)
 		}
 		finally {
-			if ($bulkCopy) {
+			if ($null -ne $bulkCopy) {
 				$bulkCopy.Close()
 				$bulkCopy.Dispose()
 			}
-			if ($sqlReader) {
+			if ($null -ne $sqlReader) {
 				$sqlReader.Close()
 				$sqlReader.Dispose()
 			}
-			if ($sqlCmd) {
+			if ($null -ne $sqlCmd) {
 				$sqlCmd.Dispose()
 			}
 		}
 	}
 
 	PurgeData() {
-		$this.State.RowsPurgedForBatch = [int](Invoke-SimpleQuery `
+		$this.State.RowsPurgedForBatch = [int](Invoke-EasySqlQuery `
 			-SqlConn $this.Group.ArcSqlConn `
 			-Query 'dbo.stp_PurgeData' `
 			-CommandType StoredProcedure `
 			-Parameters @{
-				ProcessStateId = @{
+				ProcessStateId = [EasySqlParam]@{
 					Value = $this.State.Id
 					Type  = [System.Data.SqlDbType]::Int
 				}
@@ -1406,7 +1420,7 @@ function Invoke-EasyArchiving {
 		throw
 	}
 	finally {
-		if ($group) {
+		if ($null -ne $group) {
 			$group.Dispose()
 		}
 	}
