@@ -70,7 +70,12 @@ Defines tables to archive/purge:
 | WorkingTableKeyName  | identity column name for working tables. Computed         |
 | WorkingTableFlagName | processing flag column for source working table. Computed |
 
-KeyQuery - like *select OrderId from dbo.Order where OrderDate >= dateadd(day, -1, cast(getdate() as date)) and OrderDate < cast(getdate() as date)*
+Note: *KeyQuery* should select only primary key column(s). Like this one:
+```sql
+select  OrderId
+from    dbo.Order
+where OrderDate >= dateadd(day, -1, cast(getdate() as date)) and OrderDate < cast(getdate() as date)
+```
 
 # Process State
 Tracks progress:
