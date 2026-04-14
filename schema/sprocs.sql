@@ -1,105 +1,3 @@
-if not exists (
-	select	1
-	from	INFORMATION_SCHEMA.TABLES
-	where TABLE_NAME = 'TableGroup' and TABLE_SCHEMA ='dbo' and TABLE_TYPE = 'BASE TABLE')
-begin
-	create table dbo.TableGroup
-	(
-		TableGroupId			int identity(1,1) not null,
-		[Name]					sysname not null,
-
-		SrcServerName			sysname not null,	-- source server name
-		SrcDatabaseName			sysname not null,	-- source database name
-		SrcConnectionOptions	nvarchar(max) null,	-- connection string options like ApplicationIntent, time out, user name, password etc
-
-		DstServerName			sysname not null,	-- destination server name
-		DstDatabaseName			sysname not null,	-- destination database name
-		DstConnectionOptions	nvarchar(max) null,	-- connection string options like ApplicationIntent, time out, user name, password etc
-
-		DisableFK				bit not null		-- disable FK before purge
-	)
-
-	alter table dbo.TableGroup add constraint PK_TableGroup primary key clustered (TableGroupId)
-	alter table dbo.TableGroup add constraint UQ_TableGroup__Name unique ([Name])
-end
-go
-
-if not exists (
-	select	1
-	from	INFORMATION_SCHEMA.TABLES
-	where TABLE_NAME = 'SourceTable' and TABLE_SCHEMA ='dbo' and TABLE_TYPE = 'BASE TABLE')
-begin
-	create table dbo.SourceTable
-	(
-		SourceTableId		int identity(1,1) not null,
-		TableGroupId		int not null,
-
-		SchemaName			sysname not null,
-		TableName			sysname not null,
-
-		Active				bit not null,
-
-		DataCopyBatchSize	int not null,			-- batch size for data copy
-		KeyCopyBatchSize	int not null,			-- batch size for keys copy
-		KeyQuery			nvarchar(max) not null,	-- to select primary keys values from source
-
-		Archive				bit not null,			-- can be archived
-
-		Purge				bit not null,			-- can be purged
-		PurgeOrder			smallint not null,		-- used to get purge sequence
-
-		DelayInterval		char(8) not null,		-- 'hh:mm:ss'
-
-		AlwaysRunCheck	bit not null,			-- always check for previously copied records
-
-		SrcWorkingTableName as SchemaName + '_' + TableName + '__src',	-- working table name for source primary keys
-		DstWorkingTableName as SchemaName + '_' + TableName + '__dst',	-- working table name for destination primary keys
-		WorkingTableKeyName as TableName + '__key',
-		WorkingTableFlagName as TableName + '__skip'	-- 0 - ok, 1 - means row is duplicate and must be skipped
-	)
-
-	alter table dbo.SourceTable add constraint PK_SourceTable primary key clustered (SourceTableId)
-	alter table dbo.SourceTable add constraint UQ_SourceTable__TableGroupId_SchemaName_TableName unique (TableGroupId, SchemaName, TableName)
-	create nonclustered index IX_SourceTable__TableGroupId on dbo.SourceTable(TableGroupId)
-	alter table dbo.SourceTable add constraint FK_SourceTable_TableGroup__TableGroupId foreign key (TableGroupId)
-	references dbo.TableGroup (TableGroupId)
-end
-go
-
-if not exists (
-	select	1
-	from	INFORMATION_SCHEMA.TABLES
-	where TABLE_NAME = 'ProcessState' and TABLE_SCHEMA ='dbo' and TABLE_TYPE = 'BASE TABLE')
-begin
-	create table dbo.ProcessState
-	(
-		ProcessStateId		bigint identity(1,1) not null,
-		SourceTableId		int not null,
-		CreateDate			datetime not null,
-
-		KeyCopyDate			datetime null,		-- date of primary keys copy
-
-		KeyMaxValue			int null,
-
-		LastArchivedKey		int null,			-- last copied surrogate primary key
-		LastArchivedDate	datetime null,		-- date of the last copy
-		RowsCopied			int null,			-- rows count
-
-		LastPurgedKey		int null,			-- last purged surrogate primary key
-		LastPurgedDate		datetime null,		-- date of the last purge
-		RowsPurged			int null,			-- rows count
-
-		CompleteDate		datetime null
-	)
-
-	alter table dbo.ProcessState add constraint PK_ProcessState primary key clustered (ProcessStateId)
-	create nonclustered index IXF_ProcessState__SourceTableId ON dbo.ProcessState(SourceTableId) where CompleteDate is null
-	create nonclustered index IX_ProcessState__SourceTableId ON dbo.ProcessState(SourceTableId)
-	alter table dbo.ProcessState add constraint FK_ProcessState_SourceTable__SourceTableId foreign key (SourceTableId)
-	references dbo.SourceTable (SourceTableId)
-end
-go
-
 if not exists (select 1 from INFORMATION_SCHEMA.ROUTINES where ROUTINE_NAME = 'stp_InsertProcessState' and ROUTINE_SCHEMA = 'dbo' and ROUTINE_TYPE = 'PROCEDURE')
 begin
 	exec sp_executesql N'create procedure dbo.stp_InsertProcessState as select ''Fake procedure to be replaced by alter script'''
@@ -110,10 +8,10 @@ alter procedure dbo.stp_InsertProcessState
 as
 set nocount on
 
-insert dbo.ProcessState(SourceTableId, CreateDate)
-values (@SourceTableId, getdate())
+insert dbo.ProcessState(SourceTableId)
+values (@SourceTableId)
 
-select cast(scope_identity() as bigint) ProcessStateId
+select cast(scope_identity() as int) ProcessStateId
 go
 
 if not exists (select 1 from INFORMATION_SCHEMA.ROUTINES where ROUTINE_NAME = 'stp_GetTableGroup' and ROUTINE_SCHEMA = 'dbo' and ROUTINE_TYPE = 'PROCEDURE')
@@ -129,10 +27,10 @@ set nocount on
 select	TableGroupId,
 		SrcServerName,
 		SrcDatabaseName,
-		SrcConnectionOptions,
+		SrcConnOptions,
 		DstServerName,
 		DstDatabaseName,
-		DstConnectionOptions,
+		DstConnOptions,
 		DisableFK
 from	dbo.TableGroup
 where [Name] = @Name
@@ -153,6 +51,7 @@ select	SourceTableId,
 		TableName,
 		DataCopyBatchSize,
 		KeyCopyBatchSize,
+		PurgeBatchSize,
 		KeyQuery,
 		Archive,
 		Purge,
@@ -178,14 +77,13 @@ as
 set nocount on
 
 select top 1 ProcessStateId,
-		CreateDate,
 		KeyCopyDate,
 		KeyMaxValue,
 		LastArchivedKey,
-		LastArchivedDate,
-		RowsCopied,
+		ArchiveCompleteDate,
+		RowsArchived,
 		LastPurgedKey,
-		LastPurgedDate,
+		PurgeCompleteDate,
 		RowsPurged
 from	dbo.ProcessState
 where SourceTableId = @SourceTableId and CompleteDate is null
@@ -198,16 +96,16 @@ begin
 end
 go
 alter procedure dbo.stp_UpdateProcessState
-	@ProcessStateId		bigint,
-	@KeyCopyDate		datetime = null,
+	@ProcessStateId		int,
+	@KeyCopyDate		datetime2(7) = null,
 	@KeyMaxValue		int = null,
 	@LastArchivedKey	int = null,
-	@LastArchivedDate	datetime = null,
-	@RowsCopied			int = null,
+	@ArchiveCompleteDate	datetime2(7) = null,
+	@RowsArchived			int = null,
 	@LastPurgedKey		int = null,
-	@LastPurgedDate		datetime = null,
+	@PurgeCompleteDate	datetime2(7) = null,
 	@RowsPurged			int = null,
-	@CompleteDate		datetime = null
+	@CompleteDate		datetime2(7) = null
 as
 set nocount on
 
@@ -215,12 +113,13 @@ update	dbo.ProcessState
 set		KeyCopyDate = isnull(@KeyCopyDate, KeyCopyDate),
 		KeyMaxValue = isnull(@KeyMaxValue, KeyMaxValue),
 		LastArchivedKey = isnull(@LastArchivedKey, LastArchivedKey),
-		LastArchivedDate = isnull(@LastArchivedDate, LastArchivedDate),
-		RowsCopied = isnull(@RowsCopied, RowsCopied),
+		ArchiveCompleteDate = isnull(@ArchiveCompleteDate, ArchiveCompleteDate),
+		RowsArchived = isnull(@RowsArchived, RowsArchived),
 		LastPurgedKey = isnull(@LastPurgedKey, LastPurgedKey),
-		LastPurgedDate = isnull(@LastPurgedDate, LastPurgedDate),
+		PurgeCompleteDate = isnull(@PurgeCompleteDate, PurgeCompleteDate),
 		RowsPurged = isnull(@RowsPurged, RowsPurged),
-		CompleteDate = isnull(@CompleteDate, CompleteDate)
+		CompleteDate = isnull(@CompleteDate, CompleteDate),
+		ModifyDate = sysutcdatetime()
 where ProcessStateId = @ProcessStateId
 go
 
@@ -230,7 +129,8 @@ begin
 end
 go
 alter procedure dbo.stp_GetBulkCopyData
-	@ProcessStateId	bigint
+	@ProcessStateId	int,
+	@Debug			bit = 0
 as
 set nocount on
 
@@ -254,8 +154,9 @@ from	dbo.ProcessState st
 		on gr.TableGroupId = ta.TableGroupId
 where st.ProcessStateId = @ProcessStateId
 
--- get table columns, without computed columns
-set @Query = 'set @SelectColumns = (
+-- get table columns, without computed and timestamp/rowversion columns
+set @Query = '-- dbo.stp_GetBulkCopyData
+set @SelectColumns = (
 	select	''so.['' + COLUMN_NAME + ''], ''
 	from	[' + @SrcDatabaseName + '].INFORMATION_SCHEMA.COLUMNS co
 	where TABLE_SCHEMA = ''' + @SchemaName + ''' and TABLE_NAME = ''' + @TableName + '''
@@ -265,14 +166,24 @@ set @Query = 'set @SelectColumns = (
 		from	[' + @SrcDatabaseName + '].sys.columns sc
 		where sc.[object_id] = object_id(''' + @SrcDatabaseName + '.'' + co.TABLE_SCHEMA + ''.'' + co.TABLE_NAME) and sc.[name] = co.COLUMN_NAME and sc.is_computed = 1
 		)
+		and DATA_TYPE not in(''timestamp'',''rowversion'')
 	for xml path('''')
 )'
+if @Query is null
+begin
+	raiserror('@Query(0) is null for dbo.stp_GetBulkCopyData', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@SelectColumns nvarchar(max) output', @SelectColumns = @SelectColumns output
 set @SelectColumns = left(@SelectColumns, len(@SelectColumns) - 1)
 
 -- get primary key columns for join
-set @Query = 'set @JoinColumns = (
-	select	''wo.['' + ccu.COLUMN_NAME + ''] = so.['' + ccu.COLUMN_NAME + ''] and ''
+set @Query = '-- dbo.stp_GetBulkCopyData
+set @JoinColumns = (
+	select	''so.['' + ccu.COLUMN_NAME + ''] = wo.['' + ccu.COLUMN_NAME + ''] and ''
 	from	[' + @SrcDatabaseName + '].INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
 			join [' + @SrcDatabaseName + '].INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
 			on ccu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME and ccu.TABLE_NAME = tc.TABLE_NAME and ccu.TABLE_SCHEMA = tc.TABLE_SCHEMA
@@ -280,20 +191,36 @@ set @Query = 'set @JoinColumns = (
 		and tc.CONSTRAINT_TYPE = ''PRIMARY KEY''
 	for xml path('''')
 )'
+if @Query is null
+begin
+	raiserror('@Query(1) is null for dbo.stp_GetBulkCopyData', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@JoinColumns nvarchar(max) output', @JoinColumns = @JoinColumns output
 set @JoinColumns = left(@JoinColumns, len(@JoinColumns) - 4)
 
-set @Query = 'select ' + @SelectColumns + '
-from	[' + @SrcDatabaseName + '].[' + @SchemaName + '].[' + @TableName + '] so
-		join
-		(
-		select top(@DataCopyBatchSize) t.*
+set @Query = '-- dbo.stp_GetBulkCopyData
+select ' + @SelectColumns + '
+from	(
+		select	t.*
 		from	dbo.[' + @SrcWorkingTableName + '] t
-		where t.[' + @WorkingTableKeyName + '] > @LastArchivedKey and [' + @WorkingTableFlagName + '] = 0
-		order by t.[' + @WorkingTableKeyName + ']
+		where t.[' + @WorkingTableKeyName + '] > @LastArchivedKey and t.[' + @WorkingTableKeyName + '] <= @LastArchivedKey + @DataCopyBatchSize
+			and [' + @WorkingTableFlagName + '] = 0
 		) wo
-		on ' + @JoinColumns
-
+		join [' + @SrcDatabaseName + '].[' + @SchemaName + '].[' + @TableName + '] so
+		on ' + @JoinColumns + '
+option(optimize for(@DataCopyBatchSize = ' + cast(@DataCopyBatchSize as nvarchar(100)) + ', @LastArchivedKey = 0))'
+if @Query is null
+begin
+	raiserror('@Query(2) is null for dbo.stp_GetBulkCopyData', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@DataCopyBatchSize int, @LastArchivedKey int', @DataCopyBatchSize = @DataCopyBatchSize, @LastArchivedKey = @LastArchivedKey
 go
 
@@ -303,19 +230,20 @@ begin
 end
 go
 alter procedure dbo.stp_PurgeData
-	@ProcessStateId	bigint
+	@ProcessStateId	int,
+	@Debug			bit = 0
 as
 set nocount on
 
 declare @SrcDatabaseName sysname, @SchemaName sysname, @TableName sysname, @SrcWorkingTableName sysname
 declare @WorkingTableKeyName sysname, @WorkingTableFlagName sysname
-declare @DataCopyBatchSize int, @LastPurgedKey int, @Query nvarchar(max)
+declare @PurgeBatchSize int, @LastPurgedKey int, @Query nvarchar(max)
 declare @JoinColumns nvarchar(max)
 
 select	@SrcDatabaseName = gr.SrcDatabaseName,
 		@SchemaName = ta.SchemaName,
 		@TableName = ta.TableName,
-		@DataCopyBatchSize = ta.[DataCopyBatchSize],
+		@PurgeBatchSize = ta.PurgeBatchSize,
 		@SrcWorkingTableName = ta.SrcWorkingTableName,
 		@WorkingTableKeyName = ta.WorkingTableKeyName,
 		@WorkingTableFlagName = ta.WorkingTableFlagName,
@@ -328,7 +256,8 @@ from	dbo.ProcessState st
 where st.ProcessStateId = @ProcessStateId
 
 -- get primary key columns for join
-set @Query = 'set @JoinColumns = (
+set @Query = '-- dbo.stp_PurgeData
+set @JoinColumns = (
 	select	''so.['' + ccu.COLUMN_NAME + ''] = wo.['' + ccu.COLUMN_NAME + ''] and ''
 	from	[' + @SrcDatabaseName + '].INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
 			join [' + @SrcDatabaseName + '].INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
@@ -337,23 +266,38 @@ set @Query = 'set @JoinColumns = (
 		and tc.CONSTRAINT_TYPE = ''PRIMARY KEY''
 	for xml path('''')
 )'
+if @Query is null
+begin
+	raiserror('@Query(0) is null for dbo.stp_PurgeData', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@JoinColumns nvarchar(max) output', @JoinColumns = @JoinColumns output
 set @JoinColumns = left(@JoinColumns, len(@JoinColumns) - 4)
 
-set @Query = 'delete so
-from	[' + @SrcDatabaseName + '].[' + @SchemaName + '].[' + @TableName + '] so
-		join
-		(
-		select top(@DataCopyBatchSize) t.*
+set @Query = '-- dbo.stp_PurgeData
+delete so
+from	(
+		select	t.*
 		from	dbo.[' + @SrcWorkingTableName + '] t
-		where t.[' + @WorkingTableKeyName + '] > @LastPurgedKey
-		order by t.[' + @WorkingTableKeyName + ']
+		where t.[' + @WorkingTableKeyName + '] > @LastPurgedKey and t.[' + @WorkingTableKeyName + '] <= @LastPurgedKey + @PurgeBatchSize
 		) wo
+		join [' + @SrcDatabaseName + '].[' + @SchemaName + '].[' + @TableName + '] so
 		on ' + @JoinColumns + '
+option(optimize for(@PurgeBatchSize = ' + cast(@PurgeBatchSize as nvarchar(100)) + ', @LastPurgedKey = 0))
 
 select @@rowcount RowsPurgedForBatch'
-
-exec sp_executesql @Query, N'@DataCopyBatchSize int, @LastPurgedKey int', @DataCopyBatchSize = @DataCopyBatchSize, @LastPurgedKey = @LastPurgedKey
+if @Query is null
+begin
+	raiserror('@Query(1) is null for dbo.stp_PurgeData', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
+exec sp_executesql @Query, N'@PurgeBatchSize int, @LastPurgedKey int', @PurgeBatchSize = @PurgeBatchSize, @LastPurgedKey = @LastPurgedKey
 go
 
 if not exists (select 1 from INFORMATION_SCHEMA.ROUTINES where ROUTINE_NAME = 'stp_UpdateKeyMaxValue' and ROUTINE_SCHEMA = 'dbo' and ROUTINE_TYPE = 'PROCEDURE')
@@ -362,7 +306,8 @@ begin
 end
 go
 alter procedure dbo.stp_UpdateKeyMaxValue
-	@ProcessStateId	bigint
+	@ProcessStateId	int,
+	@Debug			bit = 0
 as
 set nocount on
 
@@ -381,11 +326,23 @@ from	dbo.ProcessState ast
 		on gr.TableGroupId = ta.TableGroupId
 where ast.ProcessStateId = @ProcessStateId
 
-set @Query = 'select @KeyMaxValue = isnull(max([' + @WorkingTableKeyName + ']), 0) from dbo.[' + @SrcWorkingTableName + ']'
-
+set @Query = '-- dbo.stp_UpdateKeyMaxValue
+select	@KeyMaxValue = isnull(max([' + @WorkingTableKeyName + ']), 0)
+from	dbo.[' + @SrcWorkingTableName + ']'
+if @Query is null
+begin
+	raiserror('@Query(0) is null for dbo.stp_UpdateKeyMaxValue', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@KeyMaxValue int output', @KeyMaxValue = @KeyMaxValue output
 
-exec dbo.stp_UpdateProcessState @ProcessStateId = @ProcessStateId, @KeyMaxValue = @KeyMaxValue
+update	dbo.ProcessState
+set		KeyMaxValue = @KeyMaxValue,
+		ModifyDate = sysutcdatetime()
+where ProcessStateId = @ProcessStateId
 
 select @KeyMaxValue KeyMaxValue
 go
@@ -396,12 +353,14 @@ begin
 end
 go
 alter procedure dbo.stp_FixLastArchivedKey
-	@ProcessStateId	bigint
+	@ProcessStateId	int,
+	@Debug			bit = 0
 as
 set nocount on
 
 declare @SchemaName sysname, @TableName sysname, @SrcWorkingTableName sysname, @DstWorkingTableName sysname
-declare @WorkingTableKeyName sysname, @WorkingTableFlagName sysname, @LastArchivedKey bigint, @KeyMaxValue int
+declare @WorkingTableKeyName sysname, @WorkingTableFlagName sysname, @KeyMaxValue int
+declare @CurrentLastArchivedKey int, @NewLastArchivedKey int
 declare @Query nvarchar(max), @JoinColumns nvarchar(max)
 
 select	@SchemaName = ta.SchemaName,
@@ -410,38 +369,64 @@ select	@SchemaName = ta.SchemaName,
 		@DstWorkingTableName = ta.DstWorkingTableName,
 		@WorkingTableKeyName = ta.WorkingTableKeyName,
 		@WorkingTableFlagName = ta.WorkingTableFlagName,
+		@CurrentLastArchivedKey = ast.LastArchivedKey,
 		@KeyMaxValue = ast.KeyMaxValue
 from	dbo.ProcessState ast
 		join dbo.SourceTable ta
 		on ta.SourceTableId = ast.SourceTableId
 where ast.ProcessStateId = @ProcessStateId
 
-set @Query = 'set @JoinColumns = (
+set @Query = '-- dbo.stp_FixLastArchivedKey
+set @JoinColumns = (
 	select	''de.['' + co.COLUMN_NAME + ''] = so.['' + co.COLUMN_NAME + ''] and ''
 	from	INFORMATION_SCHEMA.COLUMNS co
 	where TABLE_SCHEMA = ''dbo'' and TABLE_NAME = ''' + @SrcWorkingTableName + '''
 		and co.COLUMN_NAME not in (''' + @WorkingTableKeyName + ''', ''' + @WorkingTableFlagName + ''')
 	for xml path('''')
 )'
+if @Query is null
+begin
+	raiserror('@Query(0) is null for dbo.stp_FixLastArchivedKey', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@JoinColumns nvarchar(max) output', @JoinColumns = @JoinColumns output
-set @JoinColumns = left(@JoinColumns, len(@JoinColumns) - 4)
+if @JoinColumns is null raiserror('@JoinColumns is null', 16, 1)
 
-set @Query = 'update	so
+set @JoinColumns = left(@JoinColumns, len(@JoinColumns) - 4)
+set @Query = '-- dbo.stp_FixLastArchivedKey
+update	so
 set		[' + @WorkingTableFlagName + '] = 1
 from	dbo.[' + @SrcWorkingTableName + '] so
 		join dbo.[' + @DstWorkingTableName + '] de
 		on ' + @JoinColumns + '
 
-select	@LastArchivedKey = min([' + @WorkingTableKeyName + ']) - 1
-from	dbo.[' + @SrcWorkingTableName + '] so
+select	@NewLastArchivedKey = min([' + @WorkingTableKeyName + ']) - 1
+from	dbo.[' + @SrcWorkingTableName + ']
 where [' + @WorkingTableFlagName + '] = 0'
-exec sp_executesql @Query, N'@LastArchivedKey bigint output', @LastArchivedKey = @LastArchivedKey output
+if @Query is null
+begin
+	raiserror('@Query(1) is null for dbo.stp_FixLastArchivedKey', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
+exec sp_executesql @Query, N'@NewLastArchivedKey int output', @NewLastArchivedKey = @NewLastArchivedKey output
 
-set @LastArchivedKey = isnull(@LastArchivedKey, @KeyMaxValue)
+set @NewLastArchivedKey = isnull(@NewLastArchivedKey, @KeyMaxValue)
 
-exec dbo.stp_UpdateProcessState @ProcessStateId = @ProcessStateId, @LastArchivedKey = @LastArchivedKey
+if @NewLastArchivedKey <> @CurrentLastArchivedKey or @CurrentLastArchivedKey is null
+begin
+	update	dbo.ProcessState
+	set		LastArchivedKey = @NewLastArchivedKey,
+			ModifyDate = sysutcdatetime()
+	where ProcessStateId = @ProcessStateId
+end
 
-select @LastArchivedKey LastArchivedKey
+select @NewLastArchivedKey LastArchivedKey
 go
 
 if not exists (select 1 from INFORMATION_SCHEMA.ROUTINES where ROUTINE_NAME = 'stp_DisableEnableFK' and ROUTINE_SCHEMA = 'dbo' and ROUTINE_TYPE = 'PROCEDURE')
@@ -450,8 +435,9 @@ begin
 end
 go
 alter procedure dbo.stp_DisableEnableFK
-	@ProcessStateId	bigint,
-	@Disable		bit
+	@ProcessStateId	int,
+	@Disable		bit,
+	@Debug			bit = 0
 as
 set nocount on
 
@@ -468,7 +454,8 @@ from	dbo.ProcessState st
 		on gr.TableGroupId = ta.TableGroupId
 where st.ProcessStateId = @ProcessStateId
 
-set @Query = 'set @AlterFK = (
+set @Query = '-- dbo.stp_DisableEnableFK
+set @AlterFK = (
 select	case	when @Disable = 1 then ''alter table [' + @SrcDatabaseName + '].['' + pa.TABLE_SCHEMA + ''].['' + pa.TABLE_NAME + ''] nocheck constraint ['' + pa.CONSTRAINT_NAME + ''];''
 				else ''alter table [' + @SrcDatabaseName + '].['' + pa.TABLE_SCHEMA + ''].['' + pa.TABLE_NAME + ''] with nocheck check constraint ['' + pa.CONSTRAINT_NAME + ''];''
 		end
@@ -481,7 +468,14 @@ from	[' + @SrcDatabaseName + '].INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS fk
 where ref.TABLE_SCHEMA = ''' + @SchemaName + ''' and ref.TABLE_NAME = ''' + @TableName + '''
 for xml path('''')
 )'
-
+if @Query is null
+begin
+	raiserror('@Query(0) is null for dbo.stp_DisableEnableFK', 16, 1)
+end
+if @Debug = 1
+begin
+	print @Query
+end
 exec sp_executesql @Query, N'@AlterFK nvarchar(max) output, @Disable bit', @AlterFK = @AlterFK output, @Disable = @Disable
 
 if @AlterFK is not null
