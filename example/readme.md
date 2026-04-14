@@ -2,7 +2,7 @@
 
 Archiving **StackOverflow2013**
 
-This example configuration demonstrates how to archive data from the *Users* table where *CreationDate <= '2008-08-15'*. The data is copied from a local SQL Server instance to a SQL Server instance running in Docker, targeting the *tempdb* database.
+This example configuration demonstrates how to archive data from the *Users* table where *CreationDate <= '2008-08-15'*. In my case the data is copied from a local SQL Server instance to a SQL Server instance running in [Docker](https://www.docker.com), targeting the *tempdb* database.
 
 To run *Easy-Archiving*:
 * Create a new *easy-archiving* database on your local SQL Server instance

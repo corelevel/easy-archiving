@@ -8,16 +8,16 @@ Easy-Archiving is a PowerShell-based framework for incremental data archiving an
 * Resume support for interrupted runs
 * Automatic schema creation on destination
 * Bulk copy for high performance
-* Foreign key disable/enable support during purge (use carefully)
+* Foreign key disable/enable support during purge(use carefully)
 * Detailed logging
 
 ## Important limitation
-* Supports PowerShell 7.0+
-* The easy-archiving database must be located on the same SQL Server instance as the source database
+* Supports only [PowerShell 7.0+](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)
+* The *easy-archiving*(name can be different) database must be located on the same SQL Server instance as the source database
 * The script does NOT copy:
     * timestamp/rowversion columns
     * Computed columns
-    * Indexes except index used by primary key or clustered index
+    * Indexes(except index used by primary key or clustered index)
 * Missing columns in destination:
     * Automatically added
     * Always created as NULLABLE
@@ -35,8 +35,8 @@ Each archive job operates on a Table Group, which defines:
 * Additional connection string options like ApplicationIntent, Connect Timeout, user name, password, etc
 
 ## Database Objects
-# Table Group
-Defines connection and behavior:
+### Table Group
+Defines connection and behavior
 | Column          | Description                               |
 | --------------- | ----------------------------------------- |
 | TableGroupId    | unique identifier                         |
@@ -49,8 +49,8 @@ Defines connection and behavior:
 | DstConnOptions  | destination connection string options     |
 | DisableFK       | disable foreign keys during purge process |
 
-# Source Table
-Defines tables to archive/purge:
+### Source Table
+Defines tables to archive/purge
 | Column               | Description                                               |
 | -------------------- | --------------------------------------------------------- |
 | SourceTableId        | unique identifier                                         |
@@ -77,8 +77,8 @@ from    dbo.Order
 where OrderDate >= dateadd(day, -1, cast(getdate() as date)) and OrderDate < cast(getdate() as date)
 ```
 
-# Process State
-Tracks progress:
+### Process State
+Tracks progress
 | Column              | Description                         |
 | ------------------- | ----------------------------------- |
 | ProcessStateId      | unique identifier                   |
@@ -93,7 +93,7 @@ Tracks progress:
 | PurgeCompleteDate   | purge completion                    |
 | CompleteDate        | full completion                     |
 
-# Usage example
+## Usage example
 ```powershell
 Invoke-EasyArchiving `
     -ConnStr 'Server=...;Database=easy_archiving;...' `
