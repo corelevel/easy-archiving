@@ -27,10 +27,10 @@ set nocount on
 select	TableGroupId,
 		SrcServerName,
 		SrcDatabaseName,
-		SrcConnectionOptions,
+		SrcConnOptions,
 		DstServerName,
 		DstDatabaseName,
-		DstConnectionOptions,
+		DstConnOptions,
 		DisableFK
 from	dbo.TableGroup
 where [Name] = @Name

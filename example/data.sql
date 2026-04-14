@@ -7,19 +7,19 @@ insert dbo.TableGroup
 	[Name],
 	SrcServerName,
 	SrcDatabaseName,
-	SrcConnectionOptions,
+	SrcConnOptions,
 	DstServerName,
 	DstDatabaseName,
-	DstConnectionOptions,
+	DstConnOptions,
 	DisableFK
 )
 select	'group01' [Name],
 		'(local)' SrcServerName,
 		'StackOverflow2013' SrcDatabaseName,
-		'Connection Timeout=5;Encrypt=False;User Id=sa;Password=P1s-Unsee-Me;Application Name=easy-archiving;' SrcConnectionOptions,
+		'Connection Timeout=5;Encrypt=False;User Id=sa;Password=P1s-Unsee-Me;Application Name=easy-archiving;' SrcConnOptions,
 		'tcp:localhost,11433' DstServerName,
 		'tempdb' DstDatabaseName,
-		'Connection Timeout=5;Encrypt=False;User Id=sa;Password=P1s-Unsee-Me;Application Name=easy-archiving;' DstConnectionOptions,
+		'Connection Timeout=5;Encrypt=False;User Id=sa;Password=P1s-Unsee-Me;Application Name=easy-archiving;' DstConnOptions,
 		0 DisableFK
 go
 insert dbo.SourceTable

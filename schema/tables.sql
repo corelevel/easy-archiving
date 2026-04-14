@@ -11,11 +11,11 @@ begin
 		CreateDate				datetime2(7) not null constraint DF_TableGroup__CreateDate default(sysdatetime()),
 		SrcServerName			sysname not null,	-- source server name
 		SrcDatabaseName			sysname not null,	-- source database name
-		SrcConnectionOptions	nvarchar(4000) null,-- connection string options like ApplicationIntent, time out, user name, password, etc
+		SrcConnOptions			nvarchar(4000) null,-- connection string options like ApplicationIntent, time out, user name, password, etc
 
 		DstServerName			sysname not null,	-- destination server name
 		DstDatabaseName			sysname not null,	-- destination database name
-		DstConnectionOptions	nvarchar(4000) null,-- connection string options like ApplicationIntent, time out, user name, password, etc
+		DstConnOptions			nvarchar(4000) null,-- connection string options like ApplicationIntent, time out, user name, password, etc
 
 		DisableFK				bit not null		-- disable FK before purge
 	)
@@ -60,7 +60,7 @@ begin
 
 		SrcWorkingTableName as SchemaName + '_' + TableName + '__src',	-- working table name for source primary keys
 		DstWorkingTableName as SchemaName + '_' + TableName + '__dst',	-- working table name for destination primary keys
-		WorkingTableKeyName as TableName + '__key',		-- working table PK column name
+		WorkingTableKeyName as TableName + '__key',		-- working table primary key column name
 		WorkingTableFlagName as TableName + '__skip'	-- 0 - ok, 1 - means row is already copied and must be skipped
 	)
 

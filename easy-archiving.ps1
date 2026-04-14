@@ -3,8 +3,11 @@ using namespace System.Collections.Generic
 
 function Write-LogMessage {
 	param(
+		[parameter(Mandatory)]
 		[string]$Message,
+
 		[string]$LogFile,
+		
 		[ValidateSet('Info','Warning','Error')]
 		[string]$Level = 'Info'
 	)
@@ -214,7 +217,7 @@ class TableGroup : System.IDisposable {
 				$this.SrcServerName = $sqlReader['SrcServerName']
 				$this.SrcDatabaseName = $sqlReader['SrcDatabaseName']
 
-				$sb = [SqlConnectionStringBuilder]::new($sqlReader['SrcConnectionOptions'])
+				$sb = [SqlConnectionStringBuilder]::new($sqlReader['SrcConnOptions'])
 				$sb['Data Source'] = $this.SrcServerName
 				$sb['Initial Catalog'] = $this.SrcDatabaseName
 				$this.SrcSqlConn.ConnectionString = $sb.ConnectionString
@@ -224,7 +227,7 @@ class TableGroup : System.IDisposable {
 				$this.DstServerName = $sqlReader['DstServerName']
 				$this.DstDatabaseName = $sqlReader['DstDatabaseName']
 
-				$sb = [SqlConnectionStringBuilder]::new($sqlReader['DstConnectionOptions'])
+				$sb = [SqlConnectionStringBuilder]::new($sqlReader['DstConnOptions'])
 				$sb['Data Source'] = $this.DstServerName
 				$sb['Initial Catalog'] = $this.DstDatabaseName
 				$sb['Persist Security Info'] = 'True'
