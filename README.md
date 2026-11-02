@@ -1,3 +1,5 @@
+This repository has been retired. Please use [Fast1data.SqlServer](https://github.com/corelevel/Fast1data.SqlServer) instead.
+
 # Easy Archiving
 
 Easy-Archiving is a PowerShell-based framework for incremental data archiving and purging between SQL Server databases. It is designed for large tables and supports batching, resumability, schema synchronization, and safe data movement.
